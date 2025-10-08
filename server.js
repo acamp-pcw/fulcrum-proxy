@@ -90,17 +90,23 @@ app.get("/schema", async (_req, res) => {
 app.post("/call", async (req, res) => {
   try {
     const { method, path, query = {}, headers = {}, body, secret } = req.body || {};
+console.log(new Date().toISOString(), "CALL", {
+  path,
+  method,
+  hasBody: !!body,
+  hasQuery: !!query,
+  gotHeaderSecret: !!req.headers["x-proxy-secret"],
+  gotBodySecret: !!(body && body.secret)
+});
 
     // NEW: accept header-based secret (preferred), fall back to body.secret
-    const headerSecret = req.headers["x-proxy-secret"];
-    const providedSecret = headerSecret || secret;
+// accept header or body secret
+const headerSecret = req.headers["x-proxy-secret"];
+const providedSecret = headerSecret || (req.body && req.body.secret);
+if (providedSecret !== SHARED_SECRET) {
+  return res.status(401).json({ error: "invalid_proxy_secret" });
+}
 
-    if (providedSecret !== SHARED_SECRET) {
-      return res
-        .status(401)
-        .set("content-type", "application/json")
-        .json({ error: "invalid_proxy_secret" });
-    }
 
     // ... keep the rest unchanged ...
 
@@ -156,4 +162,17 @@ app.post("/call", async (req, res) => {
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3000;
+
+app.post("/diag", (req, res) => {
+  const headerSecret = req.headers["x-proxy-secret"];
+  const bodySecret = req.body && req.body.secret;
+  res.json({
+    ok: true,
+    gotHeader: !!headerSecret,
+    gotBody: !!bodySecret,
+    headerMatches: headerSecret === SHARED_SECRET,
+    bodyMatches: bodySecret === SHARED_SECRET
+  });
+});
+
 app.listen(port, () => console.log("Proxy running on", port));
