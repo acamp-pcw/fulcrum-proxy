@@ -88,26 +88,27 @@ app.get("/schema", async (_req, res) => {
 
 // ------------------ proxy endpoint (single, robust) ------------------
 app.post("/call", async (req, res) => {
-  const started = Date.now();
   try {
     const { method, path, query = {}, headers = {}, body, secret } = req.body || {};
 
-    // log request succinctly
+    // request log
     console.log(new Date().toISOString(), "CALL", {
-      path, method,
+      path,
+      method,
       hasBody: !!body,
+      hasQuery: !!query,
       gotHeaderSecret: !!req.headers["x-proxy-secret"],
       gotBodySecret: !!secret
     });
 
-    // header or body secret (belt + suspenders)
-    const headerSecret = req.headers["x-proxy-secret"];
+    // header or body secret
+    const headerSecret   = req.headers["x-proxy-secret"];
     const providedSecret = headerSecret || secret;
     if (providedSecret !== SHARED_SECRET) {
       return res.status(401).json({ error: "invalid_proxy_secret" });
     }
 
-    // INTERNAL DIAG: handled locally so GPT can verify auth without changing allowlist
+    // ✅ INTERNAL DIAG handled here BEFORE the allowlist
     if (path === "/diag") {
       return res.json({
         ok: true,
@@ -118,13 +119,13 @@ app.post("/call", async (req, res) => {
       });
     }
 
-    // allowlist check
-    if (!path || !ALLOWED_PREFIXES.some(p => path.startsWith(p))) {
+    // allowlist (Fulcrum + swagger only)
+    if (!path || !ALLOWED_PREFIXES.some(pref => path.startsWith(pref))) {
       return res.status(400).json({ error: "Path not allowed" });
     }
 
     // build URL
-    const qs = Object.keys(query).length ? "?" + new URLSearchParams(query).toString() : "";
+    const qs  = Object.keys(query).length ? "?" + new URLSearchParams(query).toString() : "";
     const url = `https://api.fulcrumpro.com${path}${qs}`;
 
     // headers to Fulcrum
@@ -134,48 +135,29 @@ app.post("/call", async (req, res) => {
       "User-Agent": "fulcrum-proxy/1.0"
     });
 
-    // method inference & body handling
+    // method inference & body
     const hasBody = body && Object.keys(body).length > 0;
     const methodUp = (method || (hasBody ? "POST" : "GET")).toUpperCase();
 
-    // timeout (actions dislike long hangs)
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), 25000); // 25s cap
+    const resp = await fetch(url, {
+      method: methodUp,
+      headers: fwdHeaders,
+      body: methodUp === "GET" ? undefined : (hasBody ? JSON.stringify(body) : undefined)
+    });
 
-    let resp;
-    try {
-      resp = await fetch(url, {
-        method: methodUp,
-        headers: fwdHeaders,
-        body: methodUp === "GET" ? undefined : (hasBody ? JSON.stringify(body) : undefined),
-        signal: ac.signal
-      });
-    } finally {
-      clearTimeout(t);
-    }
-
-    // normalize upstream auth errors
     if (resp.status === 401 || resp.status === 403) {
       const text = await resp.text();
-      let upstream;
-      try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
+      let upstream; try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
       return res.status(resp.status).json({ error: "fulcrum_unauthorized", upstream });
     }
 
-    // Always return JSON the connector can parse
+    // always return JSON (connector-friendly)
     const text = await resp.text();
-    let data;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = { raw: text }; // if Fulcrum ever returns non-JSON
-    }
-
-    res.status(resp.status).json(data ?? {});
+    let data; try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+    return res.status(resp.status).json(data ?? {});
   } catch (e) {
     console.error("Proxy error:", e);
-    const ms = Date.now() - started;
-    res.status(500).json({ error: "proxy_error", detail: String(e), elapsedMs: ms });
+    return res.status(500).json({ error: "proxy_error", detail: String(e) });
   }
 });
 
