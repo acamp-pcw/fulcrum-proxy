@@ -1,11 +1,14 @@
-import express from 'express';
-// ❌ remove: import fetch from 'node-fetch';
+// server.js (CommonJS)
+const express = require('express');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const ALLOWED_PREFIX = '/api/';
 const SHARED_SECRET = process.env.SHARED_SECRET || 'replace-me';
+
+// Use Node 18+ built-ins
+const { fetch, Headers } = globalThis;
 
 app.post('/call', async (req, res) => {
   try {
@@ -21,28 +24,18 @@ app.post('/call', async (req, res) => {
     const qs = Object.keys(query).length ? '?' + new URLSearchParams(query) : '';
     const url = `https://api.fulcrumpro.com${path}${qs}`;
 
-    // ✅ Use the global Headers provided by Node 18+
     const fwdHeaders = new Headers({
-      'Authorization': `Bearer ${process.env.FULCRUM_TOKEN}`,
-      'Content-Type': headers['content-type'] || 'application/json'
+      Authorization: `Bearer ${process.env.FULCRUM_TOKEN}`,
+      'Content-Type': headers['content-type'] || 'application/json',
     });
 
     const resp = await fetch(url, {
       method: (method || 'GET').toUpperCase(),
       headers: fwdHeaders,
-      body: body ? JSON.stringify(body) : undefined
+      body: body ? JSON.stringify(body) : undefined,
     });
 
     res.status(resp.status);
-    res.set('content-type', resp.headers.get('content-type') || 'application/json');
-    resp.body.pipe(res);
-  } catch (e) {
-    console.error('Proxy error:', e); // helpful logs in Render
-    res.status(500).json({ error: String(e) });
-  }
-});
+    res.set('content-type', resp.headers.get(
 
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
-
-const port = process.env.PORT || 300
 
