@@ -5,7 +5,6 @@ app.use(express.json({ limit: "2mb" }));
 
 const ALLOWED_PREFIX = "/api/";
 const SHARED_SECRET = process.env.SHARED_SECRET || "replace-me";
-// Node 20+ provides global fetch/Headers
 const { fetch, Headers } = globalThis;
 
 app.post("/call", async (req, res) => {
@@ -33,15 +32,16 @@ app.post("/call", async (req, res) => {
       body: body ? JSON.stringify(body) : undefined
     });
 
-    // pass through status/body/content-type from Fulcrum
+    // ---- Buffered pass-through (works with Web streams) ----
+    const contentType = resp.headers.get("content-type") || "application/json";
+    const ab = await resp.arrayBuffer();                 // <— buffer the body
+    const buf = Buffer.from(ab);
+
     res.status(resp.status);
-    res.set("content-type", resp.headers.get("content-type") || "application/json");
-    if (resp.body) {
-      resp.body.pipe(res);
-    } else {
-      const text = await resp.text();
-      res.send(text);
-    }
+    res.set("content-type", contentType);
+    res.send(buf);
+    // --------------------------------------------------------
+
   } catch (e) {
     console.error("Proxy error:", e);
     res.status(500).json({ error: String(e) });
@@ -52,6 +52,3 @@ app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Proxy running on", port));
-
-
-
