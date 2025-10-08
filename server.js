@@ -34,7 +34,7 @@ function compileCatalog(sw) {
   const paths = sw.paths || {};
   for (const [p, ops] of Object.entries(paths)) {
     for (const [m, def] of Object.entries(ops)) {
-      const seg = p.split("/").filter(Boolean); // ["api","jobs","list"]
+      const seg = p.split("/").filter(Boolean);
       catalog.resources.push({
         resource: seg[1] || "root",
         op: {
@@ -78,7 +78,6 @@ app.get("/schema", async (_req, res) => {
 
 // ---------- helpers ----------
 function coerceInboundBody(reqBody) {
-  // accept any of these keys as the JSON payload container
   const candidates = [
     "body", "payload", "data", "requestBody", "json", "Body", "DATA", "JSON"
   ];
@@ -89,11 +88,9 @@ function coerceInboundBody(reqBody) {
       break;
     }
   }
-  // if still empty, also accept a raw JSON string under "raw"
   if (val == null && typeof reqBody?.raw === "string") {
-    try { val = JSON.parse(reqBody.raw); } catch { /* ignore */ }
+    try { val = JSON.parse(reqBody.raw); } catch {}
   }
-  // normalize primitives/strings to objects when possible
   if (val == null) return undefined;
   if (typeof val === "string") {
     try { return JSON.parse(val); } catch { return undefined; }
@@ -104,7 +101,6 @@ function coerceInboundBody(reqBody) {
 
 async function fetchPage({ url, methodUp, headers, body }) {
   const resp = await fetch(url, { method: methodUp, headers, body });
-  // Normalize upstream auth errors
   if (resp.status === 401 || resp.status === 403) {
     const text = await resp.text();
     let upstream; try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
@@ -114,28 +110,25 @@ async function fetchPage({ url, methodUp, headers, body }) {
     throw err;
   }
   let text = await resp.text();
-  if (!text || text.trim() === "") text = "[]"; // Lists should never return empty body to Actions
+  if (!text || text.trim() === "") text = "[]";
   let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
   return { status: resp.status, data };
 }
 
-// ---------- proxy endpoint (single, hardened, auto-paginate, body-compatible) ----------
+// ---------- proxy endpoint (auto-paginate, body-compatible) ----------
 app.post("/call", async (req, res) => {
   const started = Date.now();
   try {
-    // NOTE: accept lots of shapes; don't destructure away unknowns
     const reqBody = req.body || {};
     const method  = reqBody.method;
     const path    = reqBody.path;
     const query   = reqBody.query || {};
     const headers = reqBody.headers || {};
     const secret  = reqBody.secret;
-    const autoPage = reqBody.autoPage;
+    let autoPage  = reqBody.autoPage;
 
-    // coerce inbound "body" from any allowed alias
     const inboundBody = coerceInboundBody(reqBody);
 
-    // log
     console.log(new Date().toISOString(), "CALL", {
       path, method,
       hasBody: !!inboundBody,
@@ -144,23 +137,19 @@ app.post("/call", async (req, res) => {
       keys: Object.keys(reqBody || {})
     });
 
-    // header secret preferred, fallback to body secret if ever present
     const headerSecret   = req.headers["x-proxy-secret"];
     const providedSecret = headerSecret || secret;
     if (providedSecret !== SHARED_SECRET) {
       return res.status(401).json({ error: "invalid_proxy_secret" });
     }
 
-    // allowlist
     if (!path || !ALLOWED_PREFIXES.some(p => path.startsWith(p))) {
       return res.status(400).json({ error: "Path not allowed" });
     }
 
-    // base URL + query builder
     const baseUrl = `https://api.fulcrumpro.com${path}`;
     const baseQS = new URLSearchParams(query);
 
-    // method & body handling (GPT-proof + tolerant)
     const isList   = typeof path === "string" && /\/list(?:$|\?)/.test(path);
     const hasBody  = inboundBody && typeof inboundBody === "object" && Object.keys(inboundBody).length > 0;
     const methodUp = (method ? method.toUpperCase() : (isList ? "POST" : (hasBody ? "POST" : "GET")));
@@ -172,7 +161,6 @@ app.post("/call", async (req, res) => {
       "User-Agent": "fulcrum-proxy/1.0"
     });
 
-    // Build a non-empty payload for list endpoints even if GPT omitted "body"
     const defaultListBody = { DateFrom: "1900-01-01" };
     const finalBodyBase =
       methodUp === "GET" ? undefined :
@@ -180,15 +168,18 @@ app.post("/call", async (req, res) => {
       isList  ? JSON.stringify(defaultListBody) :
                 "{}";
 
-    // If no autoPage or not a list → single request
+    // ✅ AUTO-ENABLE PAGING for list endpoints if GPT didn't supply autoPage
+    if (isList && !autoPage) {
+      autoPage = { take: 200, maxPages: 10, sortField: "CreatedUtc", sortDir: "Asc" };
+    }
+
+    // ---- single or auto-paged request ----
     if (!isList || !autoPage) {
       const qs = baseQS.toString();
       const url = qs ? `${baseUrl}?${qs}` : baseUrl;
-
       const { status, data } = await fetchPage({
         url, methodUp, headers: fwdHeaders, body: finalBodyBase
       });
-
       return res.status(status).json(data);
     }
 
@@ -222,7 +213,6 @@ app.post("/call", async (req, res) => {
         all.push(...data.items);
         if (data.items.length < take) break;
       } else {
-        // Unexpected shape; return what we got
         return res.status(200).json(data);
       }
 
