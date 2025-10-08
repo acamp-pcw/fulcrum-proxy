@@ -138,7 +138,6 @@ const resp = await fetch(url, {
   body: finalBody
 });
 
-    } finally { clearTimeout(to); }
 
     // normalize upstream auth errors
     if (resp.status === 401 || resp.status === 403) {
