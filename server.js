@@ -5,8 +5,8 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 // ---------- config ----------
-const SHARED_SECRET   = process.env.SHARED_SECRET  || "replace-me";
-const FULCRUM_TOKEN   = process.env.FULCRUM_TOKEN  || "";
+const SHARED_SECRET    = process.env.SHARED_SECRET  || "replace-me";
+const FULCRUM_TOKEN    = process.env.FULCRUM_TOKEN  || "";
 const ALLOWED_PREFIXES = ["/api/", "/swagger/v1/swagger.json"]; // outbound allowlist
 
 // Node >=18 globals
@@ -72,58 +72,79 @@ async function getCatalog() {
 }
 
 app.get("/schema", async (_req, res) => {
-  try {
-    res.json(await getCatalog());
-  } catch (e) {
-    console.error("Schema error:", e);
-    res.status(500).json({ error: String(e) });
-  }
+  try { res.json(await getCatalog()); }
+  catch (e) { console.error("Schema error:", e); res.status(500).json({ error: String(e) }); }
 });
 
-// ---------- helper: single page fetch ----------
+// ---------- helpers ----------
+function coerceInboundBody(reqBody) {
+  // accept any of these keys as the JSON payload container
+  const candidates = [
+    "body", "payload", "data", "requestBody", "json", "Body", "DATA", "JSON"
+  ];
+  let val;
+  for (const k of candidates) {
+    if (reqBody && Object.prototype.hasOwnProperty.call(reqBody, k)) {
+      val = reqBody[k];
+      break;
+    }
+  }
+  // if still empty, also accept a raw JSON string under "raw"
+  if (val == null && typeof reqBody?.raw === "string") {
+    try { val = JSON.parse(reqBody.raw); } catch { /* ignore */ }
+  }
+  // normalize primitives/strings to objects when possible
+  if (val == null) return undefined;
+  if (typeof val === "string") {
+    try { return JSON.parse(val); } catch { return undefined; }
+  }
+  if (typeof val === "object") return val;
+  return undefined;
+}
+
 async function fetchPage({ url, methodUp, headers, body }) {
   const resp = await fetch(url, { method: methodUp, headers, body });
-  // Normalize auth errors early
+  // Normalize upstream auth errors
   if (resp.status === 401 || resp.status === 403) {
     const text = await resp.text();
-    let upstream;
-    try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
+    let upstream; try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
     const err = new Error("fulcrum_unauthorized");
     err.status = resp.status;
     err.upstream = upstream;
     throw err;
   }
   let text = await resp.text();
-  if (!text || text.trim() === "") text = "[]"; // lists should never be empty body
-  let data;
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!text || text.trim() === "") text = "[]"; // Lists should never return empty body to Actions
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
   return { status: resp.status, data };
 }
 
-// ---------- proxy endpoint (single, hardened, auto-paginate) ----------
+// ---------- proxy endpoint (single, hardened, auto-paginate, body-compatible) ----------
 app.post("/call", async (req, res) => {
   const started = Date.now();
   try {
-    const {
-      method,
-      path,
-      query = {},
-      headers = {},
-      body,
-      secret,
-      autoPage // { take?:number, maxPages?:number, maxRows?:number, sortField?:string, sortDir?: "Asc"|"Desc", startSkip?: number }
-    } = req.body || {};
+    // NOTE: accept lots of shapes; don't destructure away unknowns
+    const reqBody = req.body || {};
+    const method  = reqBody.method;
+    const path    = reqBody.path;
+    const query   = reqBody.query || {};
+    const headers = reqBody.headers || {};
+    const secret  = reqBody.secret;
+    const autoPage = reqBody.autoPage;
 
-    // concise request log
+    // coerce inbound "body" from any allowed alias
+    const inboundBody = coerceInboundBody(reqBody);
+
+    // log
     console.log(new Date().toISOString(), "CALL", {
       path, method,
-      hasBody: !!body,
+      hasBody: !!inboundBody,
       gotHeaderSecret: !!req.headers["x-proxy-secret"],
-      gotBodySecret: !!secret,
-      autoPage: !!autoPage
+      hasAutoPage: !!autoPage,
+      keys: Object.keys(reqBody || {})
     });
 
-    // header secret preferred, body fallback
+    // header secret preferred, fallback to body secret if ever present
     const headerSecret   = req.headers["x-proxy-secret"];
     const providedSecret = headerSecret || secret;
     if (providedSecret !== SHARED_SECRET) {
@@ -135,14 +156,15 @@ app.post("/call", async (req, res) => {
       return res.status(400).json({ error: "Path not allowed" });
     }
 
-    // determine method & safe body (GPT-proof)
-    const isList  = typeof path === "string" && /\/list(?:$|\?)/.test(path);
-    const hasBody = body && typeof body === "object" && Object.keys(body).length > 0;
-    const methodUp = (method
-      ? method.toUpperCase()
-      : (isList ? "POST" : (hasBody ? "POST" : "GET")));
+    // base URL + query builder
+    const baseUrl = `https://api.fulcrumpro.com${path}`;
+    const baseQS = new URLSearchParams(query);
 
-    // Upstream headers — always declare Accept
+    // method & body handling (GPT-proof + tolerant)
+    const isList   = typeof path === "string" && /\/list(?:$|\?)/.test(path);
+    const hasBody  = inboundBody && typeof inboundBody === "object" && Object.keys(inboundBody).length > 0;
+    const methodUp = (method ? method.toUpperCase() : (isList ? "POST" : (hasBody ? "POST" : "GET")));
+
     const fwdHeaders = new Headers({
       Authorization: `Bearer ${FULCRUM_TOKEN}`,
       "Content-Type": headers?.["content-type"] || "application/json",
@@ -150,35 +172,34 @@ app.post("/call", async (req, res) => {
       "User-Agent": "fulcrum-proxy/1.0"
     });
 
-    // Build base query string
-    const baseQS = new URLSearchParams(query);
-    // Default sort if autoPage requested and none provided
-    if (autoPage?.sortField && !baseQS.has("Sort.Field")) baseQS.set("Sort.Field", autoPage.sortField);
-    if (autoPage?.sortDir && !baseQS.has("Sort.Dir"))     baseQS.set("Sort.Dir", autoPage.sortDir);
-
-    const baseUrl = `https://api.fulcrumpro.com${path}`;
-
-    // Ensure non-empty body for /list endpoints (Fulcrum can return blank on empty POST)
+    // Build a non-empty payload for list endpoints even if GPT omitted "body"
     const defaultListBody = { DateFrom: "1900-01-01" };
     const finalBodyBase =
       methodUp === "GET" ? undefined :
-      hasBody ? JSON.stringify(body) :
+      hasBody ? JSON.stringify(inboundBody) :
       isList  ? JSON.stringify(defaultListBody) :
                 "{}";
 
-    // If no autoPage or not a list, do a single request
+    // If no autoPage or not a list → single request
     if (!isList || !autoPage) {
       const qs = baseQS.toString();
       const url = qs ? `${baseUrl}?${qs}` : baseUrl;
-      const { status, data } = await fetchPage({ url, methodUp, headers: fwdHeaders, body: finalBodyBase });
+
+      const { status, data } = await fetchPage({
+        url, methodUp, headers: fwdHeaders, body: finalBodyBase
+      });
+
       return res.status(status).json(data);
     }
 
     // ---- Auto-pagination for list endpoints ----
-    const take      = Math.max(1, Math.min( Number(autoPage.take ?? query?.Take ?? 200), 500 ));
-    const maxPages  = Math.max(1, Math.min( Number(autoPage.maxPages ?? 10), 100 ));
-    const maxRows   = Math.max(1, Math.min( Number(autoPage.maxRows ?? 2000), 100000 ));
+    const take      = Math.max(1, Math.min(Number(autoPage.take ?? query?.Take ?? 200), 500));
+    const maxPages  = Math.max(1, Math.min(Number(autoPage.maxPages ?? 10), 100));
+    const maxRows   = Math.max(1, Math.min(Number(autoPage.maxRows ?? 2000), 100000));
     let skip        = Number(autoPage.startSkip ?? query?.Skip ?? 0);
+
+    if (autoPage?.sortField && !baseQS.has("Sort.Field")) baseQS.set("Sort.Field", autoPage.sortField);
+    if (autoPage?.sortDir && !baseQS.has("Sort.Dir"))     baseQS.set("Sort.Dir", autoPage.sortDir);
 
     const all = [];
     for (let page = 0; page < maxPages && all.length < maxRows; page++) {
@@ -187,14 +208,16 @@ app.post("/call", async (req, res) => {
       const qs = baseQS.toString();
       const url = qs ? `${baseUrl}?${qs}` : baseUrl;
 
-      const { status, data } = await fetchPage({ url, methodUp, headers: fwdHeaders, body: finalBodyBase });
+      const { status, data } = await fetchPage({
+        url, methodUp, headers: fwdHeaders, body: finalBodyBase
+      });
       if (status < 200 || status >= 300) {
         return res.status(status).json(data);
       }
 
       if (Array.isArray(data)) {
         all.push(...data);
-        if (data.length < take) break; // last page
+        if (data.length < take) break;
       } else if (data && Array.isArray(data.items)) {
         all.push(...data.items);
         if (data.items.length < take) break;
