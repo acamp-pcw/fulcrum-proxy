@@ -170,7 +170,7 @@ app.post("/call", async (req, res) => {
 
     // ✅ AUTO-ENABLE PAGING for list endpoints if GPT didn't supply autoPage
     if (isList && !autoPage) {
-      autoPage = { take: 200, maxPages: 10, sortField: "CreatedUtc", sortDir: "asc" };
+      autoPage = { take: 200, maxPages: 10, sortField: "CreatedUtc", sortDir: "Ascending" };
     }
 
     // ---- single or auto-paged request ----
