@@ -122,25 +122,22 @@ app.post("/call", async (req, res) => {
     });
 
       // method inference & body handling (force POST for */list)
-const hasBody   = body && Object.keys(body).length > 0;
-const isList    = typeof path === "string" && /\/list(?:$|\?)/.test(path);
-const methodUp  = (method
-  ? method.toUpperCase()
-  : (isList ? "POST" : (hasBody ? "POST" : "GET")));
+// method inference & body handling (force POST for */list and default empty body)
+const hasBody  = body && Object.keys(body).length > 0;
+const isList   = typeof path === "string" && /\/list(?:$|\?)/.test(path);
+const methodUp = (method ? method.toUpperCase() : (isList ? "POST" : (hasBody ? "POST" : "GET")));
+const finalBody = methodUp === "GET" ? undefined : (hasBody ? JSON.stringify(body) : "{}");  // <-- default "{}"
 
+// optional: tiny upstream debug
+const debugId = Math.random().toString(36).slice(2);
+console.log("UPSTREAM", debugId, methodUp, path, { qs: query, hasBody, bytes: finalBody?.length ?? 0 });
 
-    // timeout to avoid connector hangs
-    const ac = new AbortController();
-    const to = setTimeout(() => ac.abort(), 25000);
+const resp = await fetch(url, {
+  method: methodUp,
+  headers: fwdHeaders,
+  body: finalBody
+});
 
-    let resp;
-    try {
-      resp = await fetch(url, {
-        method: methodUp,
-        headers: fwdHeaders,
-        body: methodUp === "GET" ? undefined : (hasBody ? JSON.stringify(body) : undefined),
-        signal: ac.signal
-      });
     } finally { clearTimeout(to); }
 
     // normalize upstream auth errors
