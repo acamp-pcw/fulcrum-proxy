@@ -80,18 +80,47 @@ app.get("/schema", async (_req, res) => {
   }
 });
 
-// ---------- proxy endpoint (single, hardened) ----------
+// ---------- helper: single page fetch ----------
+async function fetchPage({ url, methodUp, headers, body }) {
+  const resp = await fetch(url, { method: methodUp, headers, body });
+  // Normalize auth errors early
+  if (resp.status === 401 || resp.status === 403) {
+    const text = await resp.text();
+    let upstream;
+    try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
+    const err = new Error("fulcrum_unauthorized");
+    err.status = resp.status;
+    err.upstream = upstream;
+    throw err;
+  }
+  let text = await resp.text();
+  if (!text || text.trim() === "") text = "[]"; // lists should never be empty body
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  return { status: resp.status, data };
+}
+
+// ---------- proxy endpoint (single, hardened, auto-paginate) ----------
 app.post("/call", async (req, res) => {
   const started = Date.now();
   try {
-    const { method, path, query = {}, headers = {}, body, secret } = req.body || {};
+    const {
+      method,
+      path,
+      query = {},
+      headers = {},
+      body,
+      secret,
+      autoPage // { take?:number, maxPages?:number, maxRows?:number, sortField?:string, sortDir?: "Asc"|"Desc", startSkip?: number }
+    } = req.body || {};
 
     // concise request log
     console.log(new Date().toISOString(), "CALL", {
       path, method,
       hasBody: !!body,
       gotHeaderSecret: !!req.headers["x-proxy-secret"],
-      gotBodySecret: !!secret
+      gotBodySecret: !!secret,
+      autoPage: !!autoPage
     });
 
     // header secret preferred, body fallback
@@ -106,11 +135,7 @@ app.post("/call", async (req, res) => {
       return res.status(400).json({ error: "Path not allowed" });
     }
 
-    // build URL
-    const qs  = Object.keys(query).length ? "?" + new URLSearchParams(query).toString() : "";
-    const url = `https://api.fulcrumpro.com${path}${qs}`;
-
-    // determine method & construct safe body (GPT-proof)
+    // determine method & safe body (GPT-proof)
     const isList  = typeof path === "string" && /\/list(?:$|\?)/.test(path);
     const hasBody = body && typeof body === "object" && Object.keys(body).length > 0;
     const methodUp = (method
@@ -125,51 +150,72 @@ app.post("/call", async (req, res) => {
       "User-Agent": "fulcrum-proxy/1.0"
     });
 
+    // Build base query string
+    const baseQS = new URLSearchParams(query);
+    // Default sort if autoPage requested and none provided
+    if (autoPage?.sortField && !baseQS.has("Sort.Field")) baseQS.set("Sort.Field", autoPage.sortField);
+    if (autoPage?.sortDir && !baseQS.has("Sort.Dir"))     baseQS.set("Sort.Dir", autoPage.sortDir);
+
+    const baseUrl = `https://api.fulcrumpro.com${path}`;
+
     // Ensure non-empty body for /list endpoints (Fulcrum can return blank on empty POST)
-    let finalBody;
-    if (methodUp === "GET") {
-      finalBody = undefined;
-    } else if (hasBody) {
-      finalBody = JSON.stringify(body);
-    } else if (isList) {
-      finalBody = JSON.stringify({ DateFrom: "1900-01-01" });
-    } else {
-      finalBody = "{}";
+    const defaultListBody = { DateFrom: "1900-01-01" };
+    const finalBodyBase =
+      methodUp === "GET" ? undefined :
+      hasBody ? JSON.stringify(body) :
+      isList  ? JSON.stringify(defaultListBody) :
+                "{}";
+
+    // If no autoPage or not a list, do a single request
+    if (!isList || !autoPage) {
+      const qs = baseQS.toString();
+      const url = qs ? `${baseUrl}?${qs}` : baseUrl;
+      const { status, data } = await fetchPage({ url, methodUp, headers: fwdHeaders, body: finalBodyBase });
+      return res.status(status).json(data);
     }
 
-    // fire upstream
-    const resp = await fetch(url, {
-      method: methodUp,
-      headers: fwdHeaders,
-      body: finalBody
-    });
+    // ---- Auto-pagination for list endpoints ----
+    const take      = Math.max(1, Math.min( Number(autoPage.take ?? query?.Take ?? 200), 500 ));
+    const maxPages  = Math.max(1, Math.min( Number(autoPage.maxPages ?? 10), 100 ));
+    const maxRows   = Math.max(1, Math.min( Number(autoPage.maxRows ?? 2000), 100000 ));
+    let skip        = Number(autoPage.startSkip ?? query?.Skip ?? 0);
 
-    // normalize upstream auth errors
-    if (resp.status === 401 || resp.status === 403) {
-      const text = await resp.text();
-      let upstream;
-      try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
-      return res.status(resp.status).json({ error: "fulcrum_unauthorized", upstream });
+    const all = [];
+    for (let page = 0; page < maxPages && all.length < maxRows; page++) {
+      baseQS.set("Skip", String(skip));
+      baseQS.set("Take", String(take));
+      const qs = baseQS.toString();
+      const url = qs ? `${baseUrl}?${qs}` : baseUrl;
+
+      const { status, data } = await fetchPage({ url, methodUp, headers: fwdHeaders, body: finalBodyBase });
+      if (status < 200 || status >= 300) {
+        return res.status(status).json(data);
+      }
+
+      if (Array.isArray(data)) {
+        all.push(...data);
+        if (data.length < take) break; // last page
+      } else if (data && Array.isArray(data.items)) {
+        all.push(...data.items);
+        if (data.items.length < take) break;
+      } else {
+        // Unexpected shape; return what we got
+        return res.status(200).json(data);
+      }
+
+      skip += take;
+      if (all.length >= maxRows) break;
     }
 
-    // read text; never return empty body to Actions runtime
-    let text = await resp.text();
-    if (!text || text.trim() === "") {
-      text = isList ? "[]" : "{}";
-    }
+    return res.status(200).json(all);
 
-    // parse to JSON if possible
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { raw: text };
-    }
-
-    return res.status(resp.status).json(data);
   } catch (e) {
+    const ms = Date.now() - started;
     console.error("Proxy error:", e);
-    return res.status(500).json({ error: "proxy_error", detail: String(e), elapsedMs: Date.now() - started });
+    if (e?.status === 401 || e?.status === 403) {
+      return res.status(e.status).json({ error: "fulcrum_unauthorized", upstream: e.upstream });
+    }
+    return res.status(500).json({ error: "proxy_error", detail: String(e), elapsedMs: ms });
   }
 });
 
