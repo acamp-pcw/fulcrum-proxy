@@ -91,13 +91,19 @@ app.post("/call", async (req, res) => {
   try {
     const { method, path, query = {}, headers = {}, body, secret } = req.body || {};
 
-    // secret check
-    if (secret !== SHARED_SECRET) {
+    // NEW: accept header-based secret (preferred), fall back to body.secret
+    const headerSecret = req.headers["x-proxy-secret"];
+    const providedSecret = headerSecret || secret;
+
+    if (providedSecret !== SHARED_SECRET) {
       return res
         .status(401)
         .set("content-type", "application/json")
         .json({ error: "invalid_proxy_secret" });
     }
+
+    // ... keep the rest unchanged ...
+
 
     // allowlist check (MUST be inside the route handler)
     if (!path || !ALLOWED_PREFIXES.some(pref => path.startsWith(pref))) {
