@@ -175,4 +175,27 @@ app.post("/diag", (req, res) => {
   });
 });
 
+// log every /call attempt (put at top of the /call handler)
+app.post("/call", async (req, res) => {
+  const { method, path, query = {}, body } = req.body || {};
+  console.log(new Date().toISOString(), "CALL",
+    { path, method, hasBody: !!body, hasQuery: !!query,
+      gotHeaderSecret: !!req.headers["x-proxy-secret"],
+      gotBodySecret: !!(body && body.secret) });
+
+  // ... keep your existing secret check & proxy code here ...
+});
+
+app.post("/diag", (req, res) => {
+  const headerSecret = req.headers["x-proxy-secret"];
+  const bodySecret   = req.body && req.body.secret;
+  res.json({
+    ok: true,
+    gotHeader: !!headerSecret,
+    gotBody: !!bodySecret,
+    headerMatches: headerSecret === (process.env.SHARED_SECRET || "replace-me"),
+    bodyMatches: bodySecret === (process.env.SHARED_SECRET || "replace-me")
+  });
+});
+
 app.listen(port, () => console.log("Proxy running on", port));
