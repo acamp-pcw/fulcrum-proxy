@@ -1,20 +1,21 @@
+// server.js (ESM, Node >= 20)
 import express from "express";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ---- config ----
+// ---------- config ----------
 const SHARED_SECRET   = process.env.SHARED_SECRET  || "replace-me";
 const FULCRUM_TOKEN   = process.env.FULCRUM_TOKEN  || "";
 const ALLOWED_PREFIXES = ["/api/", "/swagger/v1/swagger.json"]; // outbound allowlist
 
-// Node >=18
+// Node >=18 globals
 const { fetch, Headers } = globalThis;
 
-// --------- optional: /schema (cached swagger -> compact catalog) ----------
+// ---------- optional: /schema (cached swagger -> compact catalog) ----------
 let SCHEMA_CACHE = null;
 let SCHEMA_CACHE_AT = 0;
-const SCHEMA_TTL_MS = 24 * 60 * 60 * 1000;
+const SCHEMA_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 async function fetchSwagger() {
   const r = await fetch("https://api.fulcrumpro.com/swagger/v1/swagger.json", {
@@ -38,10 +39,10 @@ function compileCatalog(sw) {
         resource: seg[1] || "root",
         op: {
           path: p,
-          method: m.toUpperCase(),
-          summary: def.summary || "",
+          method: (m || "").toUpperCase(),
+          summary: def?.summary || "",
           isList: /\/list$/.test(p),
-          acceptsBody: !!def.requestBody
+          acceptsBody: !!def?.requestBody
         }
       });
     }
@@ -64,17 +65,22 @@ function compileCatalog(sw) {
 async function getCatalog() {
   const now = Date.now();
   if (SCHEMA_CACHE && now - SCHEMA_CACHE_AT < SCHEMA_TTL_MS) return SCHEMA_CACHE;
-  SCHEMA_CACHE = compileCatalog(await fetchSwagger());
+  const sw = await fetchSwagger();
+  SCHEMA_CACHE = compileCatalog(sw);
   SCHEMA_CACHE_AT = now;
   return SCHEMA_CACHE;
 }
 
 app.get("/schema", async (_req, res) => {
-  try { res.json(await getCatalog()); }
-  catch (e) { console.error("Schema error:", e); res.status(500).json({ error: String(e) }); }
+  try {
+    res.json(await getCatalog());
+  } catch (e) {
+    console.error("Schema error:", e);
+    res.status(500).json({ error: String(e) });
+  }
 });
 
-// --------------------------- SINGLE /call ---------------------------
+// ---------- proxy endpoint (single, hardened) ----------
 app.post("/call", async (req, res) => {
   const started = Date.now();
   try {
@@ -88,75 +94,86 @@ app.post("/call", async (req, res) => {
       gotBodySecret: !!secret
     });
 
-    // authenticate (header preferred, body fallback)
-    const headerSecret = req.headers["x-proxy-secret"];
+    // header secret preferred, body fallback
+    const headerSecret   = req.headers["x-proxy-secret"];
     const providedSecret = headerSecret || secret;
     if (providedSecret !== SHARED_SECRET) {
       return res.status(401).json({ error: "invalid_proxy_secret" });
     }
 
-    // INTERNAL DIAG (handled locally; not proxied)
-    if (path === "/diag") {
-      return res.json({
-        ok: true,
-        gotHeader: !!headerSecret,
-        gotBody: !!secret,
-        headerMatches: headerSecret === SHARED_SECRET,
-        bodyMatches: secret === SHARED_SECRET
-      });
-    }
-
-    // enforce allowlist
+    // allowlist
     if (!path || !ALLOWED_PREFIXES.some(p => path.startsWith(p))) {
       return res.status(400).json({ error: "Path not allowed" });
     }
 
-    // build upstream request
+    // build URL
     const qs  = Object.keys(query).length ? "?" + new URLSearchParams(query).toString() : "";
     const url = `https://api.fulcrumpro.com${path}${qs}`;
 
+    // determine method & construct safe body (GPT-proof)
+    const isList  = typeof path === "string" && /\/list(?:$|\?)/.test(path);
+    const hasBody = body && typeof body === "object" && Object.keys(body).length > 0;
+    const methodUp = (method
+      ? method.toUpperCase()
+      : (isList ? "POST" : (hasBody ? "POST" : "GET")));
+
+    // Upstream headers — always declare Accept
     const fwdHeaders = new Headers({
       Authorization: `Bearer ${FULCRUM_TOKEN}`,
-      "Content-Type": headers["content-type"] || "application/json",
+      "Content-Type": headers?.["content-type"] || "application/json",
+      Accept: "application/json",
       "User-Agent": "fulcrum-proxy/1.0"
     });
 
-      // method inference & body handling (force POST for */list)
-// method inference & body handling (force POST for */list and default empty body)
-const hasBody  = body && Object.keys(body).length > 0;
-const isList   = typeof path === "string" && /\/list(?:$|\?)/.test(path);
-const methodUp = (method ? method.toUpperCase() : (isList ? "POST" : (hasBody ? "POST" : "GET")));
-const finalBody = methodUp === "GET" ? undefined : (hasBody ? JSON.stringify(body) : "{}");  // <-- default "{}"
+    // Ensure non-empty body for /list endpoints (Fulcrum can return blank on empty POST)
+    let finalBody;
+    if (methodUp === "GET") {
+      finalBody = undefined;
+    } else if (hasBody) {
+      finalBody = JSON.stringify(body);
+    } else if (isList) {
+      finalBody = JSON.stringify({ DateFrom: "1900-01-01" });
+    } else {
+      finalBody = "{}";
+    }
 
-// optional: tiny upstream debug
-const debugId = Math.random().toString(36).slice(2);
-console.log("UPSTREAM", debugId, methodUp, path, { qs: query, hasBody, bytes: finalBody?.length ?? 0 });
-
-const resp = await fetch(url, {
-  method: methodUp,
-  headers: fwdHeaders,
-  body: finalBody
-});
-
+    // fire upstream
+    const resp = await fetch(url, {
+      method: methodUp,
+      headers: fwdHeaders,
+      body: finalBody
+    });
 
     // normalize upstream auth errors
     if (resp.status === 401 || resp.status === 403) {
       const text = await resp.text();
-      let upstream; try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
+      let upstream;
+      try { upstream = JSON.parse(text); } catch { upstream = { raw: text }; }
       return res.status(resp.status).json({ error: "fulcrum_unauthorized", upstream });
     }
 
-    // ALWAYS return JSON (connector-friendly)
-    const text = await resp.text();
-    let data; try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
-    return res.status(resp.status).json(data ?? {});
+    // read text; never return empty body to Actions runtime
+    let text = await resp.text();
+    if (!text || text.trim() === "") {
+      text = isList ? "[]" : "{}";
+    }
+
+    // parse to JSON if possible
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+
+    return res.status(resp.status).json(data);
   } catch (e) {
     console.error("Proxy error:", e);
-    res.status(500).json({ error: "proxy_error", detail: String(e), elapsedMs: Date.now() - started });
+    return res.status(500).json({ error: "proxy_error", detail: String(e), elapsedMs: Date.now() - started });
   }
 });
 
-// --------------------------- health ---------------------------
+// ---------- health ----------
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3000;
