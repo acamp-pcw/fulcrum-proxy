@@ -122,7 +122,13 @@ app.post("/call", async (req, res) => {
     });
 
     const hasBody = body && Object.keys(body).length > 0;
-    const methodUp = (method || (hasBody ? "POST" : "GET")).toUpperCase();
+    // method inference & body handling (force POST for */list)
+const hasBody   = body && Object.keys(body).length > 0;
+const isList    = typeof path === "string" && /\/list(?:$|\?)/.test(path);
+const methodUp  = (method
+  ? method.toUpperCase()
+  : (isList ? "POST" : (hasBody ? "POST" : "GET")));
+
 
     // timeout to avoid connector hangs
     const ac = new AbortController();
