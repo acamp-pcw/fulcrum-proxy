@@ -121,8 +121,7 @@ app.post("/call", async (req, res) => {
       "User-Agent": "fulcrum-proxy/1.0"
     });
 
-    const hasBody = body && Object.keys(body).length > 0;
-    // method inference & body handling (force POST for */list)
+      // method inference & body handling (force POST for */list)
 const hasBody   = body && Object.keys(body).length > 0;
 const isList    = typeof path === "string" && /\/list(?:$|\?)/.test(path);
 const methodUp  = (method
