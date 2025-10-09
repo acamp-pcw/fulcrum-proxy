@@ -70,9 +70,11 @@ async function main() {
       headers: { "x-proxy-secret": PROXY_SECRET }
     });
     const schema = await schemaResp.json();
-    const paths = (schema.resources || [])
-      .map(r => r.op.path)
-      .filter(p => p.startsWith("/api/"));
+const paths = (schema.resources || [])
+  .map(r => r.op.path)
+  // only endpoints that actually return list data
+  .filter(p => p.startsWith("/api/") && /\/list($|\/)/.test(p));
+
 
     for (const path of paths) {
       try {
