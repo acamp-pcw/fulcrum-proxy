@@ -1,24 +1,27 @@
+// server.js — unified Fulcrum proxy + mirror API
 import express from "express";
-import mirrorRoutes from "./mirrorRoutes.js";   // keep imports together
+import mirrorRoutes from "./mirrorRoutes.js";
+import pg from "pg";   // <— added here
 
-const app = express();                          // define app first
+const { Pool } = pg;
+const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// other middleware, routes, etc.
-app.use("/mirror", mirrorRoutes);               // use routes after app exists
+// ---------- mirror routes ----------
+app.use("/mirror", mirrorRoutes);
 
 // ---------- config ----------
 const SHARED_SECRET    = process.env.SHARED_SECRET  || "replace-me";
 const FULCRUM_TOKEN    = process.env.FULCRUM_TOKEN  || "";
-const ALLOWED_PREFIXES = ["/api/", "/swagger/v1/swagger.json"]; // outbound allowlist
+const DATABASE_URL     = process.env.DATABASE_URL   || "";
+const ALLOWED_PREFIXES = ["/api/", "/swagger/v1/swagger.json"];
 
-// Node >=18 globals
 const { fetch, Headers } = globalThis;
 
-// ---------- optional: /schema (cached swagger -> compact catalog) ----------
+// ---------- swagger schema ----------
 let SCHEMA_CACHE = null;
 let SCHEMA_CACHE_AT = 0;
-const SCHEMA_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const SCHEMA_TTL_MS = 24 * 60 * 60 * 1000;
 
 async function fetchSwagger() {
   const r = await fetch("https://api.fulcrumpro.com/swagger/v1/swagger.json", {
@@ -79,11 +82,69 @@ app.get("/schema", async (_req, res) => {
   catch (e) { console.error("Schema error:", e); res.status(500).json({ error: String(e) }); }
 });
 
+// ---------- mirror read-only API ----------
+const pool = new Pool({ connectionString: DATABASE_URL });
+
+// Get 10 open jobs
+app.get("/mirror/openJobs", async (req, res) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const sql = `
+        SELECT
+          payload->>'id'            AS job_id,
+          payload->>'number'        AS job_number,
+          payload->>'name'          AS job_name,
+          payload->>'status'        AS status,
+          payload->>'dueDate'       AS due_date,
+          payload->>'customerName'  AS customer
+        FROM jobs
+        WHERE (payload->>'cancelledOnUtc' IS NULL)
+          AND (payload->>'completedOnUtc' IS NULL)
+          AND (payload->>'status' IS DISTINCT FROM 'complete')
+        ORDER BY (payload->>'createdUtc')::timestamptz DESC
+        LIMIT 10;
+      `;
+      const result = await client.query(sql);
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error("mirror/openJobs error:", e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// Universal read-only SQL query
+app.post("/mirror/query", async (req, res) => {
+  try {
+    const headerSecret = req.headers["x-proxy-secret"];
+    if (headerSecret !== SHARED_SECRET) {
+      return res.status(401).json({ error: "invalid_proxy_secret" });
+    }
+
+    const { sql } = req.body || {};
+    if (!sql || !/^select/i.test(sql.trim())) {
+      return res.status(400).json({ error: "Only SELECT statements allowed." });
+    }
+
+    const client = await pool.connect();
+    try {
+      const result = await client.query(sql);
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error("mirror/query error:", e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 // ---------- helpers ----------
 function coerceInboundBody(reqBody) {
-  const candidates = [
-    "body", "payload", "data", "requestBody", "json", "Body", "DATA", "JSON"
-  ];
+  const candidates = ["body", "payload", "data", "requestBody", "json", "Body", "DATA", "JSON"];
   let val;
   for (const k of candidates) {
     if (reqBody && Object.prototype.hasOwnProperty.call(reqBody, k)) {
@@ -118,7 +179,7 @@ async function fetchPage({ url, methodUp, headers, body }) {
   return { status: resp.status, data };
 }
 
-// ---------- proxy endpoint (auto-paginate, body-compatible) ----------
+// ---------- proxy endpoint ----------
 app.post("/call", async (req, res) => {
   const started = Date.now();
   try {
@@ -131,14 +192,7 @@ app.post("/call", async (req, res) => {
     let autoPage  = reqBody.autoPage;
 
     const inboundBody = coerceInboundBody(reqBody);
-
-    console.log(new Date().toISOString(), "CALL", {
-      path, method,
-      hasBody: !!inboundBody,
-      gotHeaderSecret: !!req.headers["x-proxy-secret"],
-      hasAutoPage: !!autoPage,
-      keys: Object.keys(reqBody || {})
-    });
+    console.log(new Date().toISOString(), "CALL", { path, method, hasBody: !!inboundBody });
 
     const headerSecret   = req.headers["x-proxy-secret"];
     const providedSecret = headerSecret || secret;
@@ -171,22 +225,18 @@ app.post("/call", async (req, res) => {
       isList  ? JSON.stringify(defaultListBody) :
                 "{}";
 
-    // ✅ AUTO-ENABLE PAGING for list endpoints if GPT didn't supply autoPage
     if (isList && !autoPage) {
       autoPage = { take: 200, maxPages: 10, sortField: "CreatedUtc", sortDir: "Ascending" };
     }
 
-    // ---- single or auto-paged request ----
     if (!isList || !autoPage) {
       const qs = baseQS.toString();
       const url = qs ? `${baseUrl}?${qs}` : baseUrl;
-      const { status, data } = await fetchPage({
-        url, methodUp, headers: fwdHeaders, body: finalBodyBase
-      });
+      const { status, data } = await fetchPage({ url, methodUp, headers: fwdHeaders, body: finalBodyBase });
       return res.status(status).json(data);
     }
 
-    // ---- Auto-pagination for list endpoints ----
+    // pagination
     const take      = Math.max(1, Math.min(Number(autoPage.take ?? query?.Take ?? 200), 500));
     const maxPages  = Math.max(1, Math.min(Number(autoPage.maxPages ?? 10), 100));
     const maxRows   = Math.max(1, Math.min(Number(autoPage.maxRows ?? 2000), 100000));
@@ -202,12 +252,8 @@ app.post("/call", async (req, res) => {
       const qs = baseQS.toString();
       const url = qs ? `${baseUrl}?${qs}` : baseUrl;
 
-      const { status, data } = await fetchPage({
-        url, methodUp, headers: fwdHeaders, body: finalBodyBase
-      });
-      if (status < 200 || status >= 300) {
-        return res.status(status).json(data);
-      }
+      const { status, data } = await fetchPage({ url, methodUp, headers: fwdHeaders, body: finalBodyBase });
+      if (status < 200 || status >= 300) return res.status(status).json(data);
 
       if (Array.isArray(data)) {
         all.push(...data);
@@ -224,7 +270,6 @@ app.post("/call", async (req, res) => {
     }
 
     return res.status(200).json(all);
-
   } catch (e) {
     const ms = Date.now() - started;
     console.error("Proxy error:", e);
