@@ -1,6 +1,9 @@
 // server.js (ESM, Node >= 20)
 import express from "express";
 
+import mirrorRoutes from "./mirrorRoutes.js";
+app.use("/mirror", mirrorRoutes);
+
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
