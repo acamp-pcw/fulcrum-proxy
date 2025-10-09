@@ -1,11 +1,11 @@
-// server.js (ESM, Node >= 20)
 import express from "express";
+import mirrorRoutes from "./mirrorRoutes.js";   // keep imports together
 
-import mirrorRoutes from "./mirrorRoutes.js";
-app.use("/mirror", mirrorRoutes);
-
-const app = express();
+const app = express();                          // define app first
 app.use(express.json({ limit: "2mb" }));
+
+// other middleware, routes, etc.
+app.use("/mirror", mirrorRoutes);               // use routes after app exists
 
 // ---------- config ----------
 const SHARED_SECRET    = process.env.SHARED_SECRET  || "replace-me";
