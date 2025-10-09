@@ -13,19 +13,21 @@ const pool = new Pool({
 const PROXY_BASE = process.env.PROXY_BASE || "https://<YOUR_PROXY>.onrender.com";
 const PROXY_SECRET = process.env.SHARED_SECRET || "<YOUR_PROXY_SECRET>";
 
-async function fetchJSON(path, body = {}) {
-  // Use POST for /list endpoints, GET otherwise
+async function fetchJSON(path) {
   const method = path.endsWith("/list") ? "POST" : "GET";
 
+  const listBody = { DateFrom: "1900-01-01", DateTo: "2100-01-01" };
+
   const resp = await fetch(`${PROXY_BASE}/call`, {
-    method: "POST",  // always POST to the proxy
+    method: "POST",
     headers: {
       "x-proxy-secret": PROXY_SECRET,
       "content-type": "application/json"
     },
     body: JSON.stringify({
       path,
-      method, // tell the proxy which HTTP verb to use upstream
+      method,
+      body: listBody,       // 👈 add this
       autoPage: {
         take: 500,
         maxPages: 100,
@@ -38,6 +40,7 @@ async function fetchJSON(path, body = {}) {
   if (!resp.ok) throw new Error(`${path} → ${resp.status}`);
   return await resp.json();
 }
+
 
 
 async function ensureTables(client) {
