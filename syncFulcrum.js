@@ -1,21 +1,21 @@
 // syncFulcrum.js
-// Mirrors selected Fulcrum /api/.../list endpoints into a Postgres database.
-// Designed to run on Render (cron or manual).
+// Full auto-discovery mirror for all Fulcrum /api/.../list endpoints.
+// Runs manually or as a Render cron job.
 
 import pg from "pg";
 import fetch from "node-fetch";
 
 const { Pool } = pg;
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL // ← your Render Postgres
+  connectionString: process.env.DATABASE_URL // ← Render Postgres
 });
 
 const PROXY_BASE   = process.env.PROXY_BASE   || "https://<YOUR_PROXY>.onrender.com";
 const PROXY_SECRET = process.env.SHARED_SECRET || "<YOUR_PROXY_SECRET>";
 
 /**
- * Fetch JSON data from the Fulcrum proxy using the same body shape
- * that works for normal /call requests.
+ * Fetch JSON data from the Fulcrum proxy.
+ * Uses same payload as your working proxy calls.
  */
 async function fetchJSON(path) {
   const resp = await fetch(`${PROXY_BASE}/call`, {
@@ -26,8 +26,8 @@ async function fetchJSON(path) {
     },
     body: JSON.stringify({
       path,
-      method: "POST",                    // proxy decides how to call upstream
-      body: { DateFrom: "1900-01-01" },  // matches working proxy default
+      method: "POST",                    // proxy decides real verb upstream
+      body: { DateFrom: "1900-01-01" },  // standard default body
       autoPage: {
         take: 500,
         maxPages: 100,
@@ -58,7 +58,7 @@ async function ensureTables(client) {
 }
 
 /**
- * Fetch one resource and store it as JSONB.
+ * Fetch a resource and store it as JSONB.
  */
 async function syncResource(client, path) {
   const resource = path.split("/")[2]; // e.g. jobs, items, inventory
@@ -85,37 +85,32 @@ async function syncResource(client, path) {
 
 /**
  * Main entry point.
+ * - Loads the schema from proxy
+ * - Extracts all /list endpoints
+ * - Mirrors each endpoint into Postgres
  */
 async function main() {
   const client = await pool.connect();
   try {
     await ensureTables(client);
 
-    // you can keep this if you want to inspect schema metadata
+    console.log("Loading schema from proxy...");
     const schemaResp = await fetch(`${PROXY_BASE}/schema`, {
       headers: { "x-proxy-secret": PROXY_SECRET }
     });
+
+    if (!schemaResp.ok) {
+      throw new Error(`Schema fetch failed: ${schemaResp.status}`);
+    }
+
     const schema = await schemaResp.json();
-    console.log(`Schema version: ${schema.version || "unknown"}`);
+    const allPaths = (schema.resources || [])
+      .map(r => r.op.path)
+      .filter(p => p.startsWith("/api/") && /\/list($|\/)/.test(p));
 
-    // Explicit list of useful bulk endpoints
-    const paths = [
-      "/api/items/list",
-      "/api/jobs/list",
-      "/api/inventory/list",
-      "/api/inventory-lots/list",
-      "/api/inventory-transactions/list",
-      "/api/vendors/list",
-      "/api/customers/list",
-      "/api/purchase-orders/list",
-      "/api/sales-orders/list",
-      "/api/work-orders/list",
-      "/api/invoices/list",
-      "/api/materials/list",
-      "/api/receiving/list"
-    ];
+    console.log(`Discovered ${allPaths.length} list endpoints.`);
 
-    for (const path of paths) {
+    for (const path of allPaths) {
       try {
         await syncResource(client, path);
       } catch (e) {
