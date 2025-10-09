@@ -70,19 +70,32 @@ async function main() {
       headers: { "x-proxy-secret": PROXY_SECRET }
     });
     const schema = await schemaResp.json();
-const paths = (schema.resources || [])
-  .map(r => r.op.path)
-  // only endpoints that actually return list data
-  .filter(p => p.startsWith("/api/") && /\/list($|\/)/.test(p));
+const paths = [
+  "/api/items/list",
+  "/api/jobs/list",
+  "/api/inventory/list",
+  "/api/inventory-lots/list",
+  "/api/inventory-transactions/list",
+  "/api/vendors/list",
+  "/api/customers/list",
+  "/api/purchase-orders/list",
+  "/api/sales-orders/list",
+  "/api/work-orders/list",
+  "/api/invoices/list",
+  "/api/materials/list",
+  "/api/receiving/list"
+];
 
 
-    for (const path of paths) {
-      try {
-        await syncResource(client, path);
-      } catch (e) {
-        console.error(`✗ failed ${path}:`, e.message);
-      }
-    }
+
+for (const path of paths) {
+  try {
+    await syncResource(client, path);
+  } catch (e) {
+    console.error(`✗ failed ${path}:`, e.message);
+  }
+}
+
     console.log("Mirror sync complete", new Date().toISOString());
   } finally {
     client.release();
