@@ -10,7 +10,7 @@
 import pg from "pg";
 import fetch from "node-fetch";
 import crypto from "crypto";
-import nodemailer from "nodemailer";
+//import nodemailer from "nodemailer";
 
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
