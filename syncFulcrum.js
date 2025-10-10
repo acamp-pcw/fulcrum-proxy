@@ -272,7 +272,8 @@ async function main() {
 
     const allPaths = (schemaResp.resources || [])
       .map(r => r.op.path)
-      .filter(p => p.startsWith('/api/') && (/\/list($|\//)/.test(p) || /routing|bom/i.test(p)));
+      .filter(p => p.startsWith('/api/') && (/\\/list($|\\/)/.test(p) || /routing|bom/i.test(p)));
+
 
     const orderedPaths = sortDependencies(allPaths);
     console.log(`Discovered ${orderedPaths.length} resources, dependency-ordered.`);
