@@ -100,7 +100,34 @@ async function syncResource(client, path) {
     const lastLog = await client.query(`SELECT last_date FROM mirror_log WHERE resource=$1 ORDER BY synced_at DESC LIMIT 1`, [resource]);
     const sinceDate = lastLog.rows[0]?.last_date || "1900-01-01";
 
-    const data = await fetchJSON(path, sinceDate);
+    let data = [];
+
+if (path.includes("{")) {
+  // Extract parameter name, e.g. "{invoiceId}" → "invoiceId"
+  const match = path.match(/{(\\w+)}/);
+  if (!match) throw new Error(`Invalid parameterized path: ${path}`);
+  const paramName = match[1];
+  const table = paramName.replace("Id", "").toLowerCase() + "s"; // e.g. invoiceId → invoices
+
+  console.log(`→ expanding parameterized endpoint: ${path} using IDs from ${table}`);
+
+  // Ensure parent table exists
+  const res = await client.query(`SELECT DISTINCT payload->>'id' AS id FROM ${table} LIMIT 1000;`);
+  const ids = res.rows.map(r => r.id).filter(Boolean);
+
+  for (const id of ids) {
+    const fullPath = path.replace(`{${paramName}}`, id);
+    try {
+      const subdata = await fetchJSON(fullPath, sinceDate);
+      if (Array.isArray(subdata)) data.push(...subdata);
+    } catch (e) {
+      console.warn(`⚠ ${fullPath} failed → ${e.message}`);
+    }
+  }
+} else {
+  data = await fetchJSON(path, sinceDate);
+}
+
     if (!Array.isArray(data) || !data.length) {
       console.log(`✓ ${resource}: no new records since ${sinceDate}`);
       return { resource, rowcount: 0, errors: [] };
