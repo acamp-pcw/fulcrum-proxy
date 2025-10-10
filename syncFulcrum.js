@@ -67,6 +67,7 @@ async function fetchJSON(path, sinceDate = "1900-01-01") {
 //-------------------------------------------------------------
 // Ensure tracking tables
 //-------------------------------------------------------------
+// Ensures both tables exist and are up to date
 async function ensureSystemTables(client) {
   await client.query(`
     CREATE TABLE IF NOT EXISTS mirror_log (
@@ -84,13 +85,36 @@ async function ensureSystemTables(client) {
       last_discovered TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+
+  // bring older mirrors forward
+  await client.query(`
+    ALTER TABLE mirror_log
+      ADD COLUMN IF NOT EXISTS hash TEXT,
+      ADD COLUMN IF NOT EXISTS last_date TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS errors JSONB;
+  `);
 }
+
 
 //-------------------------------------------------------------
 // Helper: insert big batches efficiently
 //-------------------------------------------------------------
 async function saveBatch(client, resource, data) {
   if (!data.length) return;
+  // drop invalid createdutc column if it exists with wrong type
+await client.query(`
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = $1 AND column_name = 'createdutc'
+      AND data_type NOT IN ('timestamp with time zone','timestamptz')
+    ) THEN
+      EXECUTE format('ALTER TABLE %I DROP COLUMN createdutc', $1);
+    END IF;
+  END $$;
+`, [resource]);
+
   await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB)`);
   const insert = `INSERT INTO ${resource}(payload) VALUES ($1)`;
   const batch = 1000;
@@ -187,8 +211,13 @@ async function syncResource(client, path) {
             total += sub.length;
           }
         } catch (err) {
-          console.warn(`⚠ ${fullPath} → ${err.message}`);
-        }
+  if (err.message.includes("400")) {
+    console.log(`   ↳ skipping ${fullPath} (no data or invalid for this ID)`);
+  } else {
+    console.warn(`⚠ ${fullPath} → ${err.message}`);
+  }
+}
+
         if (batchData.length > 50000) {
           await saveBatch(client, resource, batchData);
           batchData = [];
