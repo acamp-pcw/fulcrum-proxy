@@ -101,27 +101,32 @@ async function ensureSystemTables(client) {
 //-------------------------------------------------------------
 async function saveBatch(client, resource, data) {
   if (!data.length) return;
-  // drop invalid createdutc column if it exists with wrong type
-await client.query(`
-  DO $$
-  BEGIN
-    IF EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = $1 AND column_name = 'createdutc'
-      AND data_type NOT IN ('timestamp with time zone','timestamptz')
-    ) THEN
-      EXECUTE format('ALTER TABLE %I DROP COLUMN createdutc', $1);
-    END IF;
-  END $$;
-`, [resource]);
 
-  await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB)`);
+  // make sure the table exists before inserting anything
+  await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB);`);
+  await client.query(`ANALYZE ${resource};`);
+
+  // drop invalid createdutc column if it exists with wrong type
+  await client.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = $1 AND column_name = 'createdutc'
+        AND data_type NOT IN ('timestamp with time zone','timestamptz')
+      ) THEN
+        EXECUTE format('ALTER TABLE %I DROP COLUMN createdutc', $1);
+      END IF;
+    END $$;
+  `, [resource]);
+
   const insert = `INSERT INTO ${resource}(payload) VALUES ($1)`;
   const batch = 1000;
   for (let i = 0; i < data.length; i += batch) {
     const slice = data.slice(i, i + batch);
     await Promise.all(slice.map(row => client.query(insert, [row])));
   }
+
   await client.query(`
     ALTER TABLE ${resource}
       ADD COLUMN IF NOT EXISTS id TEXT GENERATED ALWAYS AS (payload->>'id') STORED,
