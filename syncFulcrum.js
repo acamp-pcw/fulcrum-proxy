@@ -102,21 +102,30 @@ async function ensureSystemTables(client) {
 //-------------------------------------------------------------
 // Helper: insert big batches efficiently
 //-------------------------------------------------------------
+//-------------------------------------------------------------
+// Helper: insert big batches efficiently (final stable)
+//-------------------------------------------------------------
 async function saveBatch(client, resource, data) {
   if (!data.length) return;
 
-  // make sure the table exists before inserting anything
+  // 1️⃣ serialize table creation so concurrent batches don't race
+  await client.query("BEGIN");
+  await client.query(`LOCK TABLE pg_class IN ACCESS EXCLUSIVE MODE`);
   await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB);`);
+  await client.query("COMMIT");
+
+  // ensure postgres registers it immediately
   await client.query(`ANALYZE ${resource};`);
 
-  // drop invalid createdutc column if it exists with wrong type
+  // 2️⃣ drop and rebuild invalid createdutc column safely
   await client.query(`
     DO $do$
     BEGIN
       IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = '${resource}' AND column_name = 'createdutc'
-        AND data_type NOT IN ('timestamp with time zone','timestamptz')
+        WHERE table_name = '${resource}'
+          AND column_name = 'createdutc'
+          AND data_type NOT IN ('timestamp with time zone','timestamptz')
       ) THEN
         EXECUTE 'ALTER TABLE ${resource} DROP COLUMN createdutc';
       END IF;
@@ -124,6 +133,7 @@ async function saveBatch(client, resource, data) {
     $do$;
   `);
 
+  // 3️⃣ insert data in parallel batches of 1000
   const insert = `INSERT INTO ${resource}(payload) VALUES ($1)`;
   const batch = 1000;
   for (let i = 0; i < data.length; i += batch) {
@@ -131,12 +141,27 @@ async function saveBatch(client, resource, data) {
     await Promise.all(slice.map(row => client.query(insert, [row])));
   }
 
+  // 4️⃣ add generated columns + index (idempotent)
   await client.query(`
     ALTER TABLE ${resource}
-      ADD COLUMN IF NOT EXISTS id TEXT GENERATED ALWAYS AS (payload->>'id') STORED,
-      ADD COLUMN IF NOT EXISTS createdutc TIMESTAMPTZ GENERATED ALWAYS AS (payload->>'createdUtc') STORED;
-    CREATE INDEX IF NOT EXISTS ${resource}_id_idx ON ${resource}(id);
+      ADD COLUMN IF NOT EXISTS id TEXT GENERATED ALWAYS AS (payload->>'id') STORED;
   `);
+
+  // rebuild createdutc cleanly
+  await client.query(`
+    DO $do$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = '${resource}' AND column_name = 'createdutc'
+      ) THEN
+        EXECUTE 'ALTER TABLE ${resource} ADD COLUMN createdutc timestamptz GENERATED ALWAYS AS (payload->>''createdUtc'') STORED';
+      END IF;
+    END
+    $do$;
+  `);
+
+  await client.query(`CREATE INDEX IF NOT EXISTS ${resource}_id_idx ON ${resource}(id);`);
 }
 
 //-------------------------------------------------------------
