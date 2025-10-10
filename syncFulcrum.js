@@ -99,6 +99,9 @@ async function ensureSystemTables(client) {
 //-------------------------------------------------------------
 // Helper: insert big batches efficiently
 //-------------------------------------------------------------
+//-------------------------------------------------------------
+// Helper: insert big batches efficiently
+//-------------------------------------------------------------
 async function saveBatch(client, resource, data) {
   if (!data.length) return;
 
@@ -108,17 +111,18 @@ async function saveBatch(client, resource, data) {
 
   // drop invalid createdutc column if it exists with wrong type
   await client.query(`
-    DO $$
+    DO $do$
     BEGIN
       IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = $1 AND column_name = 'createdutc'
+        WHERE table_name = '${resource}' AND column_name = 'createdutc'
         AND data_type NOT IN ('timestamp with time zone','timestamptz')
       ) THEN
-        EXECUTE format('ALTER TABLE %I DROP COLUMN createdutc', $1);
+        EXECUTE 'ALTER TABLE ${resource} DROP COLUMN createdutc';
       END IF;
-    END $$;
-  `, [resource]);
+    END
+    $do$;
+  `);
 
   const insert = `INSERT INTO ${resource}(payload) VALUES ($1)`;
   const batch = 1000;
