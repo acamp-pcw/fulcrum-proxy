@@ -272,7 +272,11 @@ async function main() {
 
     const allPaths = (schemaResp.resources || [])
       .map(r => r.op.path)
-      .filter(p => p.startsWith('/api/') && (/\\/list($|\\/)/.test(p) || /routing|bom/i.test(p)));
+      .filter(p =>
+  p.startsWith('/api/') &&
+  (new RegExp("/list($|/)", "i").test(p) || /routing|bom/i.test(p))
+);
+
 
 
     const orderedPaths = sortDependencies(allPaths);
