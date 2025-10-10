@@ -1,12 +1,12 @@
-// smartFulcrumMirror.js (incremental + robust + concurrent + dependency-ordered + reporting + nested expansion)
-// ============================================================================================================
+// smartFulcrumMirror.js  —  FINAL STABLE BUILD
+// ============================================================================
 // Self-aware Fulcrum data mirror with analytics and validation reporting
 // - Auto-discovers /list, /bom, /routing endpoints (including nested /{id}/list)
+// - Expands parameterized endpoints using IDs from parent tables (handles millions)
 // - Mirrors JSONB data incrementally into Postgres with concurrency and retries
-// - Expands parameterised endpoints using IDs from parent tables (handles millions safely)
 // - Enforces dependency-aware ordering (items → boms → jobs → inventory)
 // - Generates a sync summary report (rows added, schema changes, errors)
-// ============================================================================================================
+// ============================================================================
 
 import pg from "pg";
 import fetch from "node-fetch";
@@ -127,18 +127,20 @@ async function analyzeSchema(client, resource) {
 }
 
 //-------------------------------------------------------------
-// Stream parent IDs
+// Stream parent IDs efficiently (no OFFSET for huge tables)
 //-------------------------------------------------------------
 async function* streamParentIds(client, table, batchSize = 10000) {
-  let offset = 0;
+  let lastId = null;
   while (true) {
-    const res = await client.query(
-      `SELECT payload->>'id' AS id FROM ${table} ORDER BY id OFFSET $1 LIMIT $2`,
-      [offset, batchSize]
-    );
+    const query = lastId
+      ? `SELECT payload->>'id' AS id FROM ${table} WHERE payload->>'id' > $1 ORDER BY payload->>'id' LIMIT $2`
+      : `SELECT payload->>'id' AS id FROM ${table} ORDER BY payload->>'id' LIMIT $1`;
+    const params = lastId ? [lastId, batchSize] : [batchSize];
+    const res = await client.query(query, params);
     if (!res.rows.length) break;
-    yield res.rows.map(r => r.id).filter(Boolean);
-    offset += res.rows.length;
+    const ids = res.rows.map(r => r.id).filter(Boolean);
+    yield ids;
+    lastId = ids[ids.length - 1];
   }
 }
 
@@ -161,7 +163,7 @@ async function syncResource(client, path) {
   const sinceDate = last.rows[0]?.last_date || "1900-01-01";
   let total = 0;
 
-  const param = path.match(/{(\\w+)}/);
+  const param = path.match(/{(\w+)}/);   // ✅ correct regex
   if (param) {
     const paramName = param[1];
     const parentTable = paramName.replace(/Id$/, "").toLowerCase() + "s";
@@ -296,7 +298,8 @@ async function main(){
     const schemaResp=await fetchWithRetry(`${PROXY_BASE}/schema`,{headers:{'x-proxy-secret':PROXY_SECRET}});
     const allPaths=(schemaResp.resources||[])
       .map(r=>r.op.path)
-      .filter(p=>p.startsWith("/api/") && (/\\/list($|\\/)/.test(p) || /routing|bom/i.test(p)));
+      // ✅ final correct regex — no escaping issues
+      .filter(p=>p.startsWith("/api/") && (/\/list($|\/)/.test(p) || /routing|bom/i.test(p)));
     const ordered=sortDependencies(allPaths);
     console.log(`Discovered ${ordered.length} resources (dependency ordered).`);
     const results=await runConcurrentSyncs(client,ordered,5);
