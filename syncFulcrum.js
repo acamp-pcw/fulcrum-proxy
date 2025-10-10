@@ -105,35 +105,47 @@ async function ensureSystemTables(client) {
 //-------------------------------------------------------------
 // Helper: insert big batches efficiently (final stable)
 //-------------------------------------------------------------
+//-------------------------------------------------------------
+// Helper: insert big batches efficiently (transaction-safe)
+//-------------------------------------------------------------
 async function saveBatch(client, resource, data) {
   if (!data.length) return;
 
-  // 1️⃣ serialize table creation so concurrent batches don't race
-  await client.query("BEGIN");
-  await client.query(`LOCK TABLE pg_class IN ACCESS EXCLUSIVE MODE`);
-  await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB);`);
-  await client.query("COMMIT");
+  // 1️⃣ ensure table creation is serialized safely
+  try {
+    await client.query("BEGIN");
+    await client.query(`LOCK TABLE pg_class IN ACCESS EXCLUSIVE MODE`);
+    await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB);`);
+    await client.query("COMMIT");
+  } catch (e) {
+    console.warn(`⚠ table creation for ${resource} failed, rolling back → ${e.message}`);
+    try { await client.query("ROLLBACK"); } catch {}
+  }
 
-  // ensure postgres registers it immediately
-  await client.query(`ANALYZE ${resource};`);
+  // analyze so the catalog is fresh
+  try { await client.query(`ANALYZE ${resource};`); } catch {}
 
   // 2️⃣ drop and rebuild invalid createdutc column safely
-  await client.query(`
-    DO $do$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = '${resource}'
-          AND column_name = 'createdutc'
-          AND data_type NOT IN ('timestamp with time zone','timestamptz')
-      ) THEN
-        EXECUTE 'ALTER TABLE ${resource} DROP COLUMN createdutc';
-      END IF;
-    END
-    $do$;
-  `);
+  try {
+    await client.query(`
+      DO $do$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = '${resource}'
+            AND column_name = 'createdutc'
+            AND data_type NOT IN ('timestamp with time zone','timestamptz')
+        ) THEN
+          EXECUTE 'ALTER TABLE ${resource} DROP COLUMN createdutc';
+        END IF;
+      END
+      $do$;
+    `);
+  } catch (e) {
+    console.warn(`⚠ cleanup ${resource}.createdutc failed → ${e.message}`);
+  }
 
-  // 3️⃣ insert data in parallel batches of 1000
+  // 3️⃣ bulk insert data
   const insert = `INSERT INTO ${resource}(payload) VALUES ($1)`;
   const batch = 1000;
   for (let i = 0; i < data.length; i += batch) {
@@ -141,29 +153,39 @@ async function saveBatch(client, resource, data) {
     await Promise.all(slice.map(row => client.query(insert, [row])));
   }
 
-  // 4️⃣ add generated columns + index (idempotent)
-  await client.query(`
-    ALTER TABLE ${resource}
-      ADD COLUMN IF NOT EXISTS id TEXT GENERATED ALWAYS AS (payload->>'id') STORED;
-  `);
+  // 4️⃣ re-add generated columns safely
+  try {
+    await client.query(`
+      ALTER TABLE ${resource}
+        ADD COLUMN IF NOT EXISTS id TEXT GENERATED ALWAYS AS (payload->>'id') STORED;
+    `);
+  } catch (e) {
+    console.warn(`⚠ id column add skipped (${resource}) → ${e.message}`);
+  }
 
-  // rebuild createdutc cleanly
-  await client.query(`
-    DO $do$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = '${resource}' AND column_name = 'createdutc'
-      ) THEN
-        EXECUTE 'ALTER TABLE ${resource} ADD COLUMN createdutc timestamptz GENERATED ALWAYS AS (payload->>''createdUtc'') STORED';
-      END IF;
-    END
-    $do$;
-  `);
+  try {
+    await client.query(`
+      DO $do$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = '${resource}' AND column_name = 'createdutc'
+        ) THEN
+          EXECUTE 'ALTER TABLE ${resource} ADD COLUMN createdutc timestamptz GENERATED ALWAYS AS (payload->>''createdUtc'') STORED';
+        END IF;
+      END
+      $do$;
+    `);
+  } catch (e) {
+    console.warn(`⚠ createdutc add skipped (${resource}) → ${e.message}`);
+  }
 
-  await client.query(`CREATE INDEX IF NOT EXISTS ${resource}_id_idx ON ${resource}(id);`);
+  try {
+    await client.query(`CREATE INDEX IF NOT EXISTS ${resource}_id_idx ON ${resource}(id);`);
+  } catch (e) {
+    console.warn(`⚠ index creation skipped (${resource}) → ${e.message}`);
+  }
 }
-
 //-------------------------------------------------------------
 // Schema analysis
 //-------------------------------------------------------------
