@@ -91,81 +91,115 @@ async function ensureSystemTables(client) {
 //-------------------------------------------------------------
 // Sync each resource incrementally
 //-------------------------------------------------------------
+//-------------------------------------------------------------
+// Smarter resource sync with nested endpoint expansion
+//-------------------------------------------------------------
 async function syncResource(client, path) {
-  const resource = path.split("/")[2];
+  // Build a unique, SQL-safe table name
+  const resource = path
+    .split('/')
+    .filter(p => p && !p.startsWith('{') && p !== 'api')
+    .join('_')
+    .replace(/[^a-zA-Z0-9_]/g, '_');
+
   console.log(`→ syncing ${resource}`);
-  let errorMessages = [];
 
-  try {
-    const lastLog = await client.query(`SELECT last_date FROM mirror_log WHERE resource=$1 ORDER BY synced_at DESC LIMIT 1`, [resource]);
-    const sinceDate = lastLog.rows[0]?.last_date || "1900-01-01";
+  // Get last sync time (for incremental updates)
+  const lastLog = await client.query(
+    `SELECT last_date FROM mirror_log WHERE resource=$1 ORDER BY synced_at DESC LIMIT 1`,
+    [resource]
+  );
+  const sinceDate = lastLog.rows[0]?.last_date || '1900-01-01';
 
-    let data = [];
+  let allData = [];
+  let totalCount = 0;
 
-if (path.includes("{")) {
-  // Extract parameter name, e.g. "{invoiceId}" → "invoiceId"
-  const match = path.match(/{(\\w+)}/);
-  if (!match) throw new Error(`Invalid parameterized path: ${path}`);
-  const paramName = match[1];
-  const table = paramName.replace("Id", "").toLowerCase() + "s"; // e.g. invoiceId → invoices
+  // Detect parameterized paths like {invoiceId}, {itemId}, etc.
+  const paramMatch = path.match(/{(\\w+)}/);
+  if (paramMatch) {
+    const paramName = paramMatch[1];
+    const parentTable = paramName.replace(/Id$/, '').toLowerCase() + 's';
 
-  console.log(`→ expanding parameterized endpoint: ${path} using IDs from ${table}`);
+    console.log(`→ expanding parameterized endpoint: ${path} using IDs from ${parentTable}`);
 
-  // Ensure parent table exists
-  const res = await client.query(`SELECT DISTINCT payload->>'id' AS id FROM ${table} LIMIT 1000;`);
-  const ids = res.rows.map(r => r.id).filter(Boolean);
-
-  for (const id of ids) {
-    const fullPath = path.replace(`{${paramName}}`, id);
-    try {
-      const subdata = await fetchJSON(fullPath, sinceDate);
-      if (Array.isArray(subdata)) data.push(...subdata);
-    } catch (e) {
-      console.warn(`⚠ ${fullPath} failed → ${e.message}`);
+    // Confirm parent table exists
+    const exists = await client.query(
+      `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)`,
+      [parentTable]
+    );
+    if (!exists.rows[0].exists) {
+      console.warn(`⚠ Skipping ${path} — parent table ${parentTable} not found`);
+      return;
     }
+
+    // Stream IDs in batches of 10k to support millions of parents
+    const batchSize = 10000;
+    let offset = 0;
+    while (true) {
+      const idsRes = await client.query(
+        `SELECT payload->>'id' AS id FROM ${parentTable} ORDER BY id OFFSET $1 LIMIT $2`,
+        [offset, batchSize]
+      );
+      const ids = idsRes.rows.map(r => r.id).filter(Boolean);
+      if (ids.length === 0) break;
+
+      console.log(`→ ${parentTable}: processing ${ids.length} IDs (offset ${offset})`);
+      offset += ids.length;
+
+      // Call sub-endpoint for each ID
+      for (const id of ids) {
+        const fullPath = path.replace(`{${paramName}}`, id);
+        try {
+          const subdata = await fetchJSON(fullPath, sinceDate);
+          if (Array.isArray(subdata)) {
+            allData.push(...subdata);
+            totalCount += subdata.length;
+          }
+        } catch (e) {
+          console.warn(`⚠ ${fullPath} failed → ${e.message}`);
+        }
+      }
+
+      // Safety flush to avoid huge memory buildup
+      if (allData.length > 50000) {
+        await saveBatch(client, resource, allData);
+        allData = [];
+      }
+    }
+  } else {
+    // Non-parameterized endpoint
+    allData = await fetchJSON(path, sinceDate);
+    totalCount = allData.length;
   }
-} else {
-  data = await fetchJSON(path, sinceDate);
+
+  // Final flush
+  if (allData.length > 0) await saveBatch(client, resource, allData);
+
+  console.log(`✓ ${resource}: ${totalCount} total records processed`);
+  await analyzeSchema(client, resource);
 }
 
-    if (!Array.isArray(data) || !data.length) {
-      console.log(`✓ ${resource}: no new records since ${sinceDate}`);
-      return { resource, rowcount: 0, errors: [] };
-    }
-
-    await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB)`);
-    const insert = `INSERT INTO ${resource}(payload) VALUES ($1)`;
-
-    for (const row of data) {
-      await client.query(`DELETE FROM ${resource} WHERE payload->>'id' = $1`, [row.id]);
-      await client.query(insert, [row]);
-    }
-
-    await client.query(`
-      ALTER TABLE ${resource}
-        ADD COLUMN IF NOT EXISTS id TEXT GENERATED ALWAYS AS (payload->>'id') STORED,
-        ADD COLUMN IF NOT EXISTS createdutc TIMESTAMPTZ GENERATED ALWAYS AS (payload->>'createdUtc') STORED;
-      CREATE INDEX IF NOT EXISTS ${resource}_id_idx ON ${resource}(id);
-    `);
-
-    const newestDate = data[data.length - 1]?.CreatedUtc || new Date().toISOString();
-    const hash = crypto.createHash('md5').update(JSON.stringify(data)).digest('hex');
-
-    await client.query(`
-      INSERT INTO mirror_log(resource,rowcount,synced_at,hash,last_date,errors)
-      VALUES ($1,$2,NOW(),$3,$4,$5)
-    `, [resource, data.length, hash, newestDate, JSON.stringify(errorMessages)]);
-
-    console.log(`✓ ${resource}: ${data.length} updated, last=${newestDate}`);
-    await analyzeSchema(client, resource);
-    return { resource, rowcount: data.length, errors: errorMessages };
-  } catch (e) {
-    console.error(`✗ ${resource} failed: ${e.message}`);
-    errorMessages.push(e.message);
-    await client.query(`INSERT INTO mirror_log(resource,rowcount,synced_at,errors) VALUES ($1,$2,NOW(),$3)` , [resource, 0, JSON.stringify(errorMessages)]);
-    return { resource, rowcount: 0, errors: errorMessages };
+//-------------------------------------------------------------
+// Helper: insert large datasets efficiently
+//-------------------------------------------------------------
+async function saveBatch(client, resource, data) {
+  await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB)`);
+  const insert = `INSERT INTO ${resource}(payload) VALUES ($1)`;
+  const batchLimit = 1000;
+  for (let i = 0; i < data.length; i += batchLimit) {
+    const slice = data.slice(i, i + batchLimit);
+    const queries = slice.map(row => client.query(insert, [row]));
+    await Promise.all(queries);
   }
+
+  await client.query(`
+    ALTER TABLE ${resource}
+      ADD COLUMN IF NOT EXISTS id TEXT GENERATED ALWAYS AS (payload->>'id') STORED,
+      ADD COLUMN IF NOT EXISTS createdutc TIMESTAMPTZ GENERATED ALWAYS AS (payload->>'createdUtc') STORED;
+    CREATE INDEX IF NOT EXISTS ${resource}_id_idx ON ${resource}(id);
+  `);
 }
+
 
 //-------------------------------------------------------------
 // Schema analysis
