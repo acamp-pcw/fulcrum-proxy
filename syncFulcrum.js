@@ -1,34 +1,35 @@
-// smartFulcrumMirror.js (incremental + robust + concurrent + dependency-ordered + reporting)
-// =========================================================================================
+// smartFulcrumMirror.js (incremental + robust + concurrent + dependency-ordered + reporting + nested expansion)
+// ============================================================================================================
 // Self-aware Fulcrum data mirror with analytics and validation reporting
-// - Auto-discovers /list, /bom, /routing endpoints
+// - Auto-discovers /list, /bom, /routing endpoints (including nested /{id}/list)
 // - Mirrors JSONB data incrementally into Postgres with concurrency and retries
+// - Expands parameterised endpoints using IDs from parent tables (handles millions safely)
 // - Enforces dependency-aware ordering (items → boms → jobs → inventory)
 // - Generates a sync summary report (rows added, schema changes, errors)
-// =========================================================================================
+// ============================================================================================================
 
 import pg from "pg";
 import fetch from "node-fetch";
 import crypto from "crypto";
-//import nodemailer from "nodemailer";
+// import nodemailer from "nodemailer";
 
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const PROXY_BASE = process.env.PROXY_BASE || "https://<YOUR_PROXY>.onrender.com";
+const PROXY_BASE   = process.env.PROXY_BASE   || "https://<YOUR_PROXY>.onrender.com";
 const PROXY_SECRET = process.env.SHARED_SECRET || "<YOUR_PROXY_SECRET>";
 const REPORT_EMAIL = process.env.REPORT_EMAIL || null;
 
 //-------------------------------------------------------------
-// Utility: safe fetch with retry and backoff
+// Safe fetch with retry and exponential backoff
 //-------------------------------------------------------------
 async function fetchWithRetry(url, options, retries = 5, backoff = 2000) {
   for (let i = 0; i < retries; i++) {
     try {
       const resp = await fetch(url, options);
       if (resp.status === 429) {
-        const retryAfter = parseInt(resp.headers.get('retry-after')) || backoff / 1000;
-        console.warn(`Rate limited. Waiting ${retryAfter}s...`);
+        const retryAfter = parseInt(resp.headers.get("retry-after")) || backoff / 1000;
+        console.warn(`Rate limited → waiting ${retryAfter}s`);
         await new Promise(r => setTimeout(r, retryAfter * 1000));
         continue;
       }
@@ -39,14 +40,14 @@ async function fetchWithRetry(url, options, retries = 5, backoff = 2000) {
       return await resp.json();
     } catch (e) {
       if (i === retries - 1) throw e;
-      console.warn(`Retry ${i + 1}/${retries} failed → ${e.message}`);
+      console.warn(`Retry ${i + 1}/${retries} → ${e.message}`);
       await new Promise(r => setTimeout(r, backoff * Math.pow(2, i)));
     }
   }
 }
 
 //-------------------------------------------------------------
-// Fetch JSON from Fulcrum proxy
+// Proxy JSON fetcher
 //-------------------------------------------------------------
 async function fetchJSON(path, sinceDate = "1900-01-01") {
   const body = JSON.stringify({
@@ -58,16 +59,13 @@ async function fetchJSON(path, sinceDate = "1900-01-01") {
 
   return await fetchWithRetry(`${PROXY_BASE}/call`, {
     method: "POST",
-    headers: {
-      "x-proxy-secret": PROXY_SECRET,
-      "content-type": "application/json"
-    },
+    headers: { "x-proxy-secret": PROXY_SECRET, "content-type": "application/json" },
     body
   });
 }
 
 //-------------------------------------------------------------
-// System tables for tracking sync and metadata
+// Ensure tracking tables
 //-------------------------------------------------------------
 async function ensureSystemTables(client) {
   await client.query(`
@@ -89,109 +87,17 @@ async function ensureSystemTables(client) {
 }
 
 //-------------------------------------------------------------
-// Sync each resource incrementally
-//-------------------------------------------------------------
-//-------------------------------------------------------------
-// Smarter resource sync with nested endpoint expansion
-//-------------------------------------------------------------
-async function syncResource(client, path) {
-  // Build a unique, SQL-safe table name
-  const resource = path
-    .split('/')
-    .filter(p => p && !p.startsWith('{') && p !== 'api')
-    .join('_')
-    .replace(/[^a-zA-Z0-9_]/g, '_');
-
-  console.log(`→ syncing ${resource}`);
-
-  // Get last sync time (for incremental updates)
-  const lastLog = await client.query(
-    `SELECT last_date FROM mirror_log WHERE resource=$1 ORDER BY synced_at DESC LIMIT 1`,
-    [resource]
-  );
-  const sinceDate = lastLog.rows[0]?.last_date || '1900-01-01';
-
-  let allData = [];
-  let totalCount = 0;
-
-  // Detect parameterized paths like {invoiceId}, {itemId}, etc.
-  const paramMatch = path.match(/{(\\w+)}/);
-  if (paramMatch) {
-    const paramName = paramMatch[1];
-    const parentTable = paramName.replace(/Id$/, '').toLowerCase() + 's';
-
-    console.log(`→ expanding parameterized endpoint: ${path} using IDs from ${parentTable}`);
-
-    // Confirm parent table exists
-    const exists = await client.query(
-      `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)`,
-      [parentTable]
-    );
-    if (!exists.rows[0].exists) {
-      console.warn(`⚠ Skipping ${path} — parent table ${parentTable} not found`);
-      return;
-    }
-
-    // Stream IDs in batches of 10k to support millions of parents
-    const batchSize = 10000;
-    let offset = 0;
-    while (true) {
-      const idsRes = await client.query(
-        `SELECT payload->>'id' AS id FROM ${parentTable} ORDER BY id OFFSET $1 LIMIT $2`,
-        [offset, batchSize]
-      );
-      const ids = idsRes.rows.map(r => r.id).filter(Boolean);
-      if (ids.length === 0) break;
-
-      console.log(`→ ${parentTable}: processing ${ids.length} IDs (offset ${offset})`);
-      offset += ids.length;
-
-      // Call sub-endpoint for each ID
-      for (const id of ids) {
-        const fullPath = path.replace(`{${paramName}}`, id);
-        try {
-          const subdata = await fetchJSON(fullPath, sinceDate);
-          if (Array.isArray(subdata)) {
-            allData.push(...subdata);
-            totalCount += subdata.length;
-          }
-        } catch (e) {
-          console.warn(`⚠ ${fullPath} failed → ${e.message}`);
-        }
-      }
-
-      // Safety flush to avoid huge memory buildup
-      if (allData.length > 50000) {
-        await saveBatch(client, resource, allData);
-        allData = [];
-      }
-    }
-  } else {
-    // Non-parameterized endpoint
-    allData = await fetchJSON(path, sinceDate);
-    totalCount = allData.length;
-  }
-
-  // Final flush
-  if (allData.length > 0) await saveBatch(client, resource, allData);
-
-  console.log(`✓ ${resource}: ${totalCount} total records processed`);
-  await analyzeSchema(client, resource);
-}
-
-//-------------------------------------------------------------
-// Helper: insert large datasets efficiently
+// Helper: insert big batches efficiently
 //-------------------------------------------------------------
 async function saveBatch(client, resource, data) {
+  if (!data.length) return;
   await client.query(`CREATE TABLE IF NOT EXISTS ${resource} (payload JSONB)`);
   const insert = `INSERT INTO ${resource}(payload) VALUES ($1)`;
-  const batchLimit = 1000;
-  for (let i = 0; i < data.length; i += batchLimit) {
-    const slice = data.slice(i, i + batchLimit);
-    const queries = slice.map(row => client.query(insert, [row]));
-    await Promise.all(queries);
+  const batch = 1000;
+  for (let i = 0; i < data.length; i += batch) {
+    const slice = data.slice(i, i + batch);
+    await Promise.all(slice.map(row => client.query(insert, [row])));
   }
-
   await client.query(`
     ALTER TABLE ${resource}
       ADD COLUMN IF NOT EXISTS id TEXT GENERATED ALWAYS AS (payload->>'id') STORED,
@@ -200,7 +106,6 @@ async function saveBatch(client, resource, data) {
   `);
 }
 
-
 //-------------------------------------------------------------
 // Schema analysis
 //-------------------------------------------------------------
@@ -208,49 +113,130 @@ async function analyzeSchema(client, resource) {
   const sample = await client.query(`SELECT payload FROM ${resource} LIMIT 25;`);
   const keys = new Set();
   sample.rows.forEach(r => Object.keys(r.payload || {}).forEach(k => keys.add(k)));
-
   const keyFields = [...keys].filter(k => /id$/i.test(k));
   const rels = {};
-  for (const key of keyFields) {
-    const target = key.replace(/Id$/i, '').toLowerCase() + 's';
-    rels[key] = target;
+  for (const k of keyFields) rels[k] = k.replace(/Id$/i, "").toLowerCase() + "s";
+  await client.query(`
+    INSERT INTO mirror_meta(table_name,key_fields,relationships,last_discovered)
+    VALUES ($1,$2,$3,NOW())
+    ON CONFLICT (table_name) DO UPDATE
+      SET key_fields=EXCLUDED.key_fields,
+          relationships=EXCLUDED.relationships,
+          last_discovered=NOW();
+  `,[resource, JSON.stringify([...keys]), JSON.stringify(rels)]);
+}
+
+//-------------------------------------------------------------
+// Stream parent IDs
+//-------------------------------------------------------------
+async function* streamParentIds(client, table, batchSize = 10000) {
+  let offset = 0;
+  while (true) {
+    const res = await client.query(
+      `SELECT payload->>'id' AS id FROM ${table} ORDER BY id OFFSET $1 LIMIT $2`,
+      [offset, batchSize]
+    );
+    if (!res.rows.length) break;
+    yield res.rows.map(r => r.id).filter(Boolean);
+    offset += res.rows.length;
+  }
+}
+
+//-------------------------------------------------------------
+// Smart resource sync with nested expansion
+//-------------------------------------------------------------
+async function syncResource(client, path) {
+  const resource = path
+    .split("/")
+    .filter(p => p && !p.startsWith("{") && p !== "api")
+    .join("_")
+    .replace(/[^a-zA-Z0-9_]/g, "_");
+
+  console.log(`→ syncing ${resource}`);
+
+  const last = await client.query(
+    `SELECT last_date FROM mirror_log WHERE resource=$1 ORDER BY synced_at DESC LIMIT 1`,
+    [resource]
+  );
+  const sinceDate = last.rows[0]?.last_date || "1900-01-01";
+  let total = 0;
+
+  const param = path.match(/{(\\w+)}/);
+  if (param) {
+    const paramName = param[1];
+    const parentTable = paramName.replace(/Id$/, "").toLowerCase() + "s";
+    const exists = await client.query(
+      `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name=$1)`,
+      [parentTable]
+    );
+    if (!exists.rows[0].exists) {
+      console.warn(`⚠ skipping ${path}: parent ${parentTable} missing`);
+      return { resource, rowcount: 0, errors: [`missing parent ${parentTable}`] };
+    }
+
+    let batchData = [];
+    for await (const ids of streamParentIds(client, parentTable, 10000)) {
+      for (const id of ids) {
+        const fullPath = path.replace(`{${paramName}}`, id);
+        try {
+          const sub = await fetchJSON(fullPath, sinceDate);
+          if (Array.isArray(sub) && sub.length) {
+            batchData.push(...sub);
+            total += sub.length;
+          }
+        } catch (err) {
+          console.warn(`⚠ ${fullPath} → ${err.message}`);
+        }
+        if (batchData.length > 50000) {
+          await saveBatch(client, resource, batchData);
+          batchData = [];
+        }
+      }
+    }
+    await saveBatch(client, resource, batchData);
+  } else {
+    const data = await fetchJSON(path, sinceDate);
+    await saveBatch(client, resource, data);
+    total = data.length;
   }
 
-  await client.query(`
-    INSERT INTO mirror_meta(table_name, key_fields, relationships, last_discovered)
-    VALUES ($1,$2,$3,NOW())
-    ON CONFLICT (table_name) DO UPDATE SET
-      key_fields=EXCLUDED.key_fields,
-      relationships=EXCLUDED.relationships,
-      last_discovered=NOW();
-  `, [resource, JSON.stringify([...keys]), JSON.stringify(rels)]);
+  const hash = crypto.createHash("md5").update(String(total)).digest("hex");
+  await client.query(
+    `INSERT INTO mirror_log(resource,rowcount,synced_at,hash,last_date,errors)
+     VALUES ($1,$2,NOW(),$3,$4,$5)`,
+    [resource, total, hash, new Date().toISOString(), JSON.stringify([])]
+  );
+  console.log(`✓ ${resource}: ${total} rows`);
+  await analyzeSchema(client, resource);
+  return { resource, rowcount: total, errors: [] };
 }
 
 //-------------------------------------------------------------
 // Dependency ordering
 //-------------------------------------------------------------
 function sortDependencies(paths) {
-  const priority = ['items', 'item-boms', 'routing', 'jobs', 'workorders', 'inventory', 'materials', 'customers', 'vendors'];
-  return paths.sort((a, b) => {
-    const getRank = p => priority.findIndex(k => p.includes(k));
-    const ra = getRank(a);
-    const rb = getRank(b);
-    return (ra === -1 ? 99 : ra) - (rb === -1 ? 99 : rb);
+  const priority = ["items","item-boms","routing","jobs","workorders","inventory","materials","customers","vendors"];
+  return paths.sort((a,b)=>{
+    const rank = p => priority.findIndex(k=>p.includes(k));
+    const ra=rank(a), rb=rank(b);
+    return (ra===-1?99:ra)-(rb===-1?99:rb);
   });
 }
 
 //-------------------------------------------------------------
-// Batch sync with concurrency
+// Run concurrent batches
 //-------------------------------------------------------------
-async function runConcurrentSyncs(client, paths, batchSize = 5) {
+async function runConcurrentSyncs(client, paths, batchSize=5) {
   const ordered = sortDependencies(paths);
-  let results = [];
-  for (let i = 0; i < ordered.length; i += batchSize) {
-    const batch = ordered.slice(i, i + batchSize);
-    console.log(`→ Running batch ${i / batchSize + 1}/${Math.ceil(ordered.length / batchSize)} (${batch.join(', ')})`);
-    const batchResults = await Promise.all(batch.map(p => syncResource(client, p)));
+  const results=[];
+  for(let i=0;i<ordered.length;i+=batchSize){
+    const slice=ordered.slice(i,i+batchSize);
+    console.log(`→ batch ${i/batchSize+1}/${Math.ceil(ordered.length/batchSize)} (${slice.join(", ")})`);
+    const batchResults=await Promise.all(slice.map(p=>syncResource(client,p).catch(e=>{
+      console.error(`✗ ${p}: ${e.message}`); return {resource:p,rowcount:0,errors:[e.message]};
+    })));
     results.push(...batchResults);
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r=>setTimeout(r,1000));
   }
   return results;
 }
@@ -258,7 +244,7 @@ async function runConcurrentSyncs(client, paths, batchSize = 5) {
 //-------------------------------------------------------------
 // Build analytical views
 //-------------------------------------------------------------
-async function buildViews(client) {
+async function buildViews(client){
   await client.query(`
     CREATE OR REPLACE VIEW job_items AS
     SELECT (payload->>'id') AS job_id,
@@ -277,84 +263,53 @@ async function buildViews(client) {
     SELECT j.job_id,
            j.item_id,
            c.component_id,
-           (c.qty_per * j.qty_to_make) AS required_qty,
+           (c.qty_per*j.qty_to_make) AS required_qty,
            COALESCE((inv.payload->>'onHandQuantity')::numeric,0) AS available_qty,
-           (c.qty_per * j.qty_to_make - COALESCE((inv.payload->>'onHandQuantity')::numeric,0)) AS missing_qty
+           (c.qty_per*j.qty_to_make-COALESCE((inv.payload->>'onHandQuantity')::numeric,0)) AS missing_qty
     FROM job_items j
-    JOIN item_boms c ON c.item_id = j.item_id
-    LEFT JOIN inventory inv ON inv.payload->>'itemId' = c.component_id
-    WHERE (c.qty_per * j.qty_to_make - COALESCE((inv.payload->>'onHandQuantity')::numeric,0)) > 0;
+    JOIN item_boms c ON c.item_id=j.item_id
+    LEFT JOIN inventory inv ON inv.payload->>'itemId'=c.component_id
+    WHERE (c.qty_per*j.qty_to_make-COALESCE((inv.payload->>'onHandQuantity')::numeric,0))>0;
   `);
 }
 
 //-------------------------------------------------------------
-// Generate and optionally email summary report
+// Console summary (email disabled by default)
 //-------------------------------------------------------------
-async function reportResults(results) {
-  const total = results.reduce((sum, r) => sum + r.rowcount, 0);
-  const failed = results.filter(r => r.errors.length > 0);
-
-  const summary = `\nFulcrum Mirror Sync Summary\n===========================\n
-Total Resources: ${results.length}\nTotal Rows Synced: ${total}\nFailures: ${failed.length}\n
-` + results.map(r => `• ${r.resource}: ${r.rowcount} rows${r.errors.length ? ` (errors: ${r.errors.join('; ')})` : ''}`).join('\n');
-
-  console.log(summary);
-
-  if (REPORT_EMAIL) {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: process.env.SMTP_PORT || 587,
-      secure: false,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-    });
-
-    await transporter.sendMail({
-      from: `Fulcrum Mirror <${process.env.SMTP_USER}>`,
-      to: REPORT_EMAIL,
-      subject: `Fulcrum Mirror Sync Report - ${new Date().toISOString()}`,
-      text: summary
-    });
-    console.log(`✉ Report emailed to ${REPORT_EMAIL}`);
-  }
+async function reportResults(results){
+  const total = results.reduce((s,r)=>s+r.rowcount,0);
+  const failed = results.filter(r=>r.errors.length);
+  console.log(`\nFulcrum Mirror Summary\n=======================\nResources: ${results.length}\nRows: ${total}\nFailures: ${failed.length}\n`);
+  results.forEach(r=>{
+    console.log(`• ${r.resource}: ${r.rowcount} ${r.errors.length?`errors: ${r.errors.join("; ")}`:""}`);
+  });
 }
 
 //-------------------------------------------------------------
 // Main orchestrator
 //-------------------------------------------------------------
-async function main() {
-  const client = await pool.connect();
-  try {
+async function main(){
+  const client=await pool.connect();
+  try{
     await ensureSystemTables(client);
-
-    console.log('Loading schema from proxy...');
-    const schemaResp = await fetchWithRetry(`${PROXY_BASE}/schema`, {
-      headers: { 'x-proxy-secret': PROXY_SECRET }
-    });
-
-    const allPaths = (schemaResp.resources || [])
-      .map(r => r.op.path)
-      .filter(p =>
-  p.startsWith('/api/') &&
-  (new RegExp("/list($|/)", "i").test(p) || /routing|bom/i.test(p))
-);
-
-
-
-    const orderedPaths = sortDependencies(allPaths);
-    console.log(`Discovered ${orderedPaths.length} resources, dependency-ordered.`);
-
-    const results = await runConcurrentSyncs(client, orderedPaths, 5);
+    console.log("Loading schema from proxy...");
+    const schemaResp=await fetchWithRetry(`${PROXY_BASE}/schema`,{headers:{'x-proxy-secret':PROXY_SECRET}});
+    const allPaths=(schemaResp.resources||[])
+      .map(r=>r.op.path)
+      .filter(p=>p.startsWith("/api/") && (/\\/list($|\\/)/.test(p) || /routing|bom/i.test(p)));
+    const ordered=sortDependencies(allPaths);
+    console.log(`Discovered ${ordered.length} resources (dependency ordered).`);
+    const results=await runConcurrentSyncs(client,ordered,5);
     await buildViews(client);
     await reportResults(results);
-
-    console.log('Mirror sync with reporting complete', new Date().toISOString());
-  } finally {
+    console.log("Mirror sync complete",new Date().toISOString());
+  }finally{
     client.release();
     await pool.end();
   }
 }
 
-main().catch(e => {
-  console.error('Mirror job failed:', e);
+main().catch(e=>{
+  console.error("Mirror job failed:",e);
   process.exit(1);
 });
